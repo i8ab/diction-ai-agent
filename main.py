@@ -1,16 +1,27 @@
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Any
 import os
 import time
 import uuid
+
 from llm import extract_vocabulary_from_text, extract_vocabulary_from_pdf
+from rag import (
+    extract_full_text_from_pdf,
+    save_book,
+    load_book,
+    list_books,
+    delete_book,
+    retrieve_relevant_chunks,
+    build_chat_prompt,
+    generate_answer,
+)
 
 app = FastAPI(
-    title="Dictionary AI Agent",
-    description="Extract vocabulary from English textbooks",
-    version="0.2.0"
+    title="Dictionary AI Agent + Book Chat",
+    description="Extract vocabulary from textbooks + RAG chatbot that answers only from uploaded books",
+    version="1.0.0",
 )
 
 # ====================== CORS ======================
@@ -20,6 +31,7 @@ origins = [
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
+    "*",  # allow testing; tighten later if needed
 ]
 
 app.add_middleware(
@@ -33,18 +45,21 @@ app.add_middleware(
 # ====================== Security ======================
 API_SECRET = os.getenv("API_SECRET", "bacaloria-secret-2026")
 
+
 def verify_secret(x_api_secret: Optional[str] = Header(None)):
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Invalid or missing API secret")
     return True
 
-# ====================== Models ======================
+
+# ====================== Models (Vocabulary) ======================
 class ExtractTextRequest(BaseModel):
     text: str
     source_book: Optional[str] = None
     unit: Optional[str] = None
     section: Optional[str] = "en-ar"
     added_by: Optional[str] = "ai-agent"
+
 
 class EntryOut(BaseModel):
     id: str
@@ -59,64 +74,67 @@ class EntryOut(BaseModel):
     section: str = "en-ar"
     addedAt: int
     addedBy: str
-    # extra fields (optional, for future use)
     source_book: Optional[str] = None
     unit: Optional[str] = None
     page: Optional[int] = None
     from_ai: bool = True
     importance: Optional[str] = None
 
+
+# ====================== Models (Chat / Books) ======================
+class ChatRequest(BaseModel):
+    book_id: str
+    question: str
+    top_k: Optional[int] = 6
+
+
+class ChatResponse(BaseModel):
+    success: bool
+    answer: str
+    book_id: str
+    book_title: Optional[str] = None
+    sources_used: int = 0
+    message: Optional[str] = None
+
+
 # ====================== Helpers ======================
 def generate_id() -> str:
     return uuid.uuid4().hex[:16]
 
-def adapt_entry(raw: dict, source_book: str = None, unit: str = None, section: str = "en-ar", added_by: str = "ai-agent") -> dict:
-    """Convert AI Agent raw output to the exact format used in Supabase entries table"""
-    
-    # synonyms / antonyms as {word} objects so frontend chips render correctly
+
+def adapt_entry(
+    raw: dict,
+    source_book: str = None,
+    unit: str = None,
+    section: str = "en-ar",
+    added_by: str = "ai-agent",
+) -> dict:
+    """Convert AI Agent raw output to the format used in the dictionary frontend."""
+
     def normalize_list(items):
         if not items:
             return []
         result = []
         for item in items:
             if isinstance(item, dict):
-                w = (item.get("word") or item.get("text") or "").strip()
-            else:
-                w = str(item).strip()
-            if w:
-                result.append({"word": w})
+                result.append(item)
+            elif isinstance(item, str) and item.strip():
+                result.append({"word": item.strip()})
         return result
 
+    senses = raw.get("senses") or []
+    primary_meaning = raw.get("meaning") or ""
+    if senses and not primary_meaning:
+        primary_meaning = senses[0].get("meaning", "")
+
     now = int(time.time() * 1000)
-
-    # senses: multiple Arabic meanings
-    senses_raw = raw.get("senses") or []
-    senses = []
-    if isinstance(senses_raw, list):
-        for s in senses_raw:
-            if not isinstance(s, dict):
-                continue
-            m = str(s.get("meaning") or "").strip()
-            if not m:
-                continue
-            senses.append({
-                "pos": str(s.get("pos") or raw.get("pos") or "").strip(),
-                "meaning": m,
-            })
-
-    meaning = raw.get("meaning", "").strip()
-    pos = raw.get("pos")
-    if senses:
-        meaning = meaning or senses[0]["meaning"]
-        pos = pos or senses[0].get("pos")
-
     out = {
         "id": generate_id(),
-        "word": raw.get("word", "").strip(),
-        "meaning": meaning,
-        "pos": pos,
+        "word": (raw.get("word") or "").strip(),
+        "meaning": primary_meaning,
+        "pos": raw.get("pos"),
         "definition": raw.get("definition"),
-        "example": raw.get("example"),
+        "example": raw.get("example") or (raw.get("examples") or [None])[0],
         "examples": raw.get("examples") or [],
         "synonyms": normalize_list(raw.get("synonyms")),
         "antonyms": normalize_list(raw.get("antonyms")),
@@ -133,15 +151,21 @@ def adapt_entry(raw: dict, source_book: str = None, unit: str = None, section: s
         out["senses"] = senses
     return out
 
-# ====================== Endpoints ======================
+
+# ====================== Basic Endpoints ======================
 @app.get("/")
 def root():
     return {
-        "service": "Dictionary AI Agent",
+        "service": "Dictionary AI Agent + Book Chat",
         "status": "running",
-        "version": "0.3.0",
-        "llm_provider": os.getenv("LLM_PROVIDER", "gemini")
+        "version": "1.0.0",
+        "llm_provider": os.getenv("LLM_PROVIDER", "gemini"),
+        "features": [
+            "vocabulary extraction from text/PDF",
+            "upload full book + RAG chat (answers only from the book)",
+        ],
     }
+
 
 @app.get("/health")
 def health():
@@ -149,9 +173,12 @@ def health():
         "ok": True,
         "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
         "groq_configured": bool(os.getenv("GROQ_API_KEY")),
-        "active_provider": os.getenv("LLM_PROVIDER", "gemini")
+        "active_provider": os.getenv("LLM_PROVIDER", "gemini"),
+        "books_count": len(list_books()),
     }
 
+
+# ====================== Vocabulary Endpoints (old) ======================
 @app.post("/extract", dependencies=[Depends(verify_secret)])
 async def extract_from_text(req: ExtractTextRequest):
     if not req.text or len(req.text.strip()) < 20:
@@ -159,24 +186,22 @@ async def extract_from_text(req: ExtractTextRequest):
 
     try:
         raw_entries = extract_vocabulary_from_text(req.text)
-        
         adapted = [
             adapt_entry(
                 e,
                 source_book=req.source_book,
                 unit=req.unit,
                 section=req.section,
-                added_by=req.added_by
+                added_by=req.added_by,
             )
             for e in raw_entries
         ]
-
         return {
             "success": True,
             "entries": adapted,
             "count": len(adapted),
             "message": f"Extracted {len(adapted)} entries",
-            "provider_used": os.getenv("LLM_PROVIDER", "gemini")
+            "provider_used": os.getenv("LLM_PROVIDER", "gemini"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -191,9 +216,8 @@ async def extract_from_pdf(
     added_by: Optional[str] = "ai-agent",
     page_from: Optional[int] = 1,
     page_to: Optional[int] = None,
-    x_api_secret: Optional[str] = Header(None)
+    x_api_secret: Optional[str] = Header(None),
 ):
-    # Manual secret check because File upload makes Depends a bit tricky sometimes
     if x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Invalid or missing API secret")
 
@@ -209,20 +233,17 @@ async def extract_from_pdf(
             page_to=page_to,
             max_ocr_pages=50,
         )
-
         book_name = source_book or file.filename.replace(".pdf", "")
-
         adapted = [
             adapt_entry(
                 e,
                 source_book=book_name,
                 unit=unit,
                 section=section,
-                added_by=added_by
+                added_by=added_by,
             )
             for e in raw_entries
         ]
-
         range_label = f"pages {page_from or 1}" + (f"-{page_to}" if page_to else "+")
         return {
             "success": True,
@@ -235,3 +256,135 @@ async def extract_from_pdf(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====================== Book Upload + Chat (NEW) ======================
+@app.post("/upload-book", dependencies=[Depends(verify_secret)])
+async def upload_book(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    x_api_secret: Optional[str] = Header(None),
+):
+    """
+    Upload a full PDF book → extract text → chunk → store for chat.
+    After this you can call /chat with the returned book_id.
+    """
+    if x_api_secret != API_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing API secret")
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    # Size limit ~ 40 MB (free tier friendly)
+    content = await file.read()
+    if len(content) > 40 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 40 MB)")
+
+    try:
+        full_text, page_count, used_ocr = extract_full_text_from_pdf(
+            content, max_ocr_pages=40
+        )
+        book_meta = save_book(
+            title=title or file.filename.replace(".pdf", "").replace(".PDF", ""),
+            full_text=full_text,
+            filename=file.filename,
+            page_count=page_count,
+            used_ocr=used_ocr,
+        )
+        return {
+            "success": True,
+            "book": book_meta,
+            "message": (
+                f"Book uploaded successfully. "
+                f"{book_meta['chunk_count']} chunks created from {page_count} pages."
+                + (" (OCR used)" if used_ocr else "")
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/books", dependencies=[Depends(verify_secret)])
+def get_books():
+    """List all uploaded books."""
+    return {"success": True, "books": list_books()}
+
+
+@app.get("/books/{book_id}", dependencies=[Depends(verify_secret)])
+def get_book(book_id: str):
+    book = load_book(book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return {
+        "success": True,
+        "book": {
+            "id": book["id"],
+            "title": book.get("title"),
+            "filename": book.get("filename"),
+            "page_count": book.get("page_count"),
+            "chunk_count": book.get("chunk_count"),
+            "used_ocr": book.get("used_ocr", False),
+            "created_at": book.get("created_at"),
+        },
+    }
+
+
+@app.delete("/books/{book_id}", dependencies=[Depends(verify_secret)])
+def remove_book(book_id: str):
+    ok = delete_book(book_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return {"success": True, "message": "Book deleted"}
+
+
+@app.post("/chat", dependencies=[Depends(verify_secret)])
+async def chat(req: ChatRequest):
+    """
+    Ask a question about an uploaded book.
+    The answer is generated ONLY from the book content (RAG).
+    """
+    question = (req.question or "").strip()
+    if not question or len(question) < 2:
+        raise HTTPException(status_code=400, detail="Question is too short")
+
+    book = load_book(req.book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found. Upload it first with /upload-book")
+
+    top_k = max(1, min(req.top_k or 6, 12))
+    hits = retrieve_relevant_chunks(book, question, top_k=top_k)
+
+    # Filter very low relevance if possible
+    contexts = [h["text"] for h in hits if h.get("score", 0) > 0 or True]
+
+    if not contexts:
+        return {
+            "success": True,
+            "answer": "مش لاقي أجزاء مناسبة في الكتاب للإجابة على السؤال ده. جرب تصيغ السؤال بطريقة تانية أو تأكد إن المعلومة موجودة في الكتاب.",
+            "book_id": req.book_id,
+            "book_title": book.get("title"),
+            "sources_used": 0,
+        }
+
+    prompt = build_chat_prompt(question, contexts)
+
+    try:
+        answer = generate_answer(prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
+
+    return {
+        "success": True,
+        "answer": answer,
+        "book_id": req.book_id,
+        "book_title": book.get("title"),
+        "sources_used": len(contexts),
+        "message": "Answer generated from book content only",
+    }
+
+
+# ====================== Run locally ======================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

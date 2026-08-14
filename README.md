@@ -1,62 +1,102 @@
-# Dictionary AI Agent
+# Dictionary AI Agent + Book Chatbot (RAG)
 
-سيرفر منفصل لاستخراج المفردات من الكتب الإنجليزية المدرسية ورفعها في القاموس.
+سيرفر واحد بيعمل حاجتين:
 
-## المميزات
+1. **استخراج المفردات** من كتب إنجليزية مدرسية (الوظيفة القديمة)
+2. **شات بوت تعليمي** بيجاوب على أي سؤال من محتوى الكتاب المرفوع فقط (قواعد، ترجمة، شرح، تمارين...)
 
-- يستخرج الكلمات المهمة فقط (مش كل كلمة)
-- يجيب المعنى العربي (من السياق أو من معرفة النموذج)
-- المرادفات والأضداد **فقط** لو موجودة جوه النص
-- بيدعم رفع PDF مباشرة
-- بيرجع البيانات بنفس شكل القاموس الحالي
+---
+
+## المميزات الجديدة (Chat)
+
+- رفع كتاب PDF كامل
+- تخزين الكتاب على شكل قطع (chunks)
+- البحث عن الأجزاء الأكثر صلة بالسؤال (BM25)
+- الإجابة باستخدام LLM (Groq أو Gemini) **فقط من محتوى الكتاب**
+- يدعم أسئلة بالعربي والإنجليزي
+- يترجم ويشرح grammar لو موجود في الكتاب
+
+---
+
+## Endpoints
+
+| Method | Path | الوصف |
+|--------|------|--------|
+| GET | `/` | معلومات السيرفر |
+| GET | `/health` | فحص الحالة |
+| POST | `/extract` | استخراج مفردات من نص |
+| POST | `/extract-pdf` | استخراج مفردات من PDF |
+| **POST** | **`/upload-book`** | **رفع كتاب كامل للشات** |
+| **GET** | **`/books`** | **قائمة الكتب المرفوعة** |
+| **GET** | **`/books/{book_id}`** | **تفاصيل كتاب** |
+| **DELETE** | **`/books/{book_id}`** | **حذف كتاب** |
+| **POST** | **`/chat`** | **اسأل سؤال عن كتاب** |
+
+كل الـ endpoints (ماعدا `/` و `/health`) محتاجة هيدر:
+```
+X-API-Secret: <قيمة API_SECRET>
+```
+
+---
+
+## أمثلة استخدام
+
+### 1. رفع كتاب
+```bash
+curl -X POST "https://YOUR-SERVER/upload-book" \
+  -H "X-API-Secret: your_secret" \
+  -F "file=@english_book.pdf" \
+  -F "title=English for Secondary 3"
+```
+
+الرد:
+```json
+{
+  "success": true,
+  "book": {
+    "id": "a1b2c3d4e5f6",
+    "title": "English for Secondary 3",
+    "page_count": 120,
+    "chunk_count": 85
+  }
+}
+```
+
+### 2. سؤال الشات
+```bash
+curl -X POST "https://YOUR-SERVER/chat" \
+  -H "X-API-Secret: your_secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "book_id": "a1b2c3d4e5f6",
+    "question": "اشرح قاعدة present perfect الموجودة في الكتاب"
+  }'
+```
+
+### 3. قائمة الكتب
+```bash
+curl -H "X-API-Secret: your_secret" https://YOUR-SERVER/books
+```
 
 ---
 
 ## الرفع على Render (مجاني)
 
-### 1. ارفع الكود على GitHub
-
-```bash
-git init
-git add .
-git commit -m "AI Agent initial"
-# اعمل repo جديد على GitHub وبعدين:
-git remote add origin https://github.com/YOUR_USERNAME/diction-ai-agent.git
-git push -u origin main
-```
-
-### 2. اعمل Web Service على Render
-
-1. روح على https://dashboard.render.com
-2. New → Web Service
-3. اربط الـ GitHub repo
-4. الإعدادات:
-   - Name: diction-ai-agent
-   - Runtime: Python
-   - Build Command: pip install -r requirements.txt
-   - Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
-   - Instance Type: Free
-
-### 3. Environment Variables (مهم)
-
-في صفحة الـ Service → Environment أضف:
+1. ارفع المجلد ده على GitHub
+2. New → Web Service على Render
+3. الإعدادات:
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+4. Environment Variables:
 
 | Key | Value |
 |-----|-------|
-| LLM_PROVIDER | groq |
-| GROQ_API_KEY | المفتاح بتاعك من Groq |
-| GEMINI_API_KEY | المفتاح بتاعك من Gemini (اختياري) |
-| API_SECRET | أي نص سري عشوائي |
+| `LLM_PROVIDER` | `groq` |
+| `GROQ_API_KEY` | مفتاحك من console.groq.com |
+| `GEMINI_API_KEY` | (اختياري) لو عايز OCR أو fallback |
+| `API_SECRET` | نص سري عشوائي |
 
-### 4. بعد الرفع
-
-السيرفر هيبقى على رابط زي:
-https://diction-ai-agent.onrender.com
-
-- التوثيق: /docs
-- الصحة: /health
-
-ملاحظة: على الخطة المجانية السيرفر بينام بعد 15 دقيقة سكون. أول طلب بعد النوم بياخد 30–60 ثانية.
+> ملاحظة: على الخطة المجانية الملفات بتتمسح لما السيرفر ينام. للكتب المهمة استخدم تخزين خارجي لاحقًا (Supabase Storage / S3).
 
 ---
 
@@ -69,14 +109,52 @@ cp .env.example .env
 python main.py
 ```
 
-## Endpoints
+بعدها افتح: http://localhost:8000/docs
 
-| Method | Path | الوصف |
-|--------|------|--------|
-| GET | / | معلومات السيرفر |
-| GET | /health | فحص الحالة |
-| POST | /extract | استخراج من نص |
-| POST | /extract-pdf | استخراج من PDF |
+---
 
-كل طلبات الاستخراج تحتاج الهيدر:
-X-API-Secret: القيمة اللي حاططها في API_SECRET
+## الربط مع الفرونت إند (Bacaloria)
+
+تقدر تضيف صفحة شات بسيطة:
+
+1. المستخدم يرفع PDF → تستدعي `/upload-book`
+2. تحفظ `book_id` اللي راجع
+3. أي سؤال يروح لـ `/chat` مع نفس الـ `book_id`
+
+مثال JavaScript:
+
+```js
+// رفع كتاب
+const form = new FormData();
+form.append("file", pdfFile);
+form.append("title", "كتابي");
+
+const uploadRes = await fetch(`${AI_URL}/upload-book`, {
+  method: "POST",
+  headers: { "X-API-Secret": AI_SECRET },
+  body: form,
+});
+const { book } = await uploadRes.json();
+
+// سؤال
+const chatRes = await fetch(`${AI_URL}/chat`, {
+  method: "POST",
+  headers: {
+    "X-API-Secret": AI_SECRET,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    book_id: book.id,
+    question: "ما معنى كلمة ambition في الكتاب؟",
+  }),
+});
+const { answer } = await chatRes.json();
+```
+
+---
+
+## ملاحظات مهمة
+
+- الشات **مش** بيستخدم معرفة النموذج العامة. لو المعلومة مش في الكتاب هيقولك كده.
+- الكتب الممسوحة (صور) محتاجة `GEMINI_API_KEY` للـ OCR.
+- حجم الملف الأقصى تقريبًا 40 ميجا.

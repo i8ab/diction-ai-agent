@@ -114,8 +114,12 @@ def extract_full_text_from_pdf(
 
         ocr_prompt = (
             "Extract ALL readable text from this textbook page image. "
-            "Preserve headings, explanations, grammar rules, examples, "
-            "vocabulary lists, and exercises. Output plain text only."
+            "Preserve headings, explanations, grammar rules, examples, and exercises. "
+            "If you see a bilingual English-Arabic vocabulary table (possibly with several "
+            "side-by-side column blocks per row), read each block fully top-to-bottom before "
+            "moving to the next block, and output every pair as its own line: "
+            "'english_word = الترجمة العربية'. Do not merge unrelated rows. "
+            "Output plain text only, no markdown."
         )
         parts = []
         ocr_count = 0

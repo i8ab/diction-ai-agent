@@ -28,8 +28,13 @@ SYSTEM_PROMPT = """You are an expert English vocabulary extractor for school tex
 
 Your job:
 1. Extract ONLY important vocabulary words that the textbook intends students to learn.
-   - Look for: Key Words, Vocabulary lists, Words to learn, highlighted words, words with definitions.
+   - Look for: Key Words, Vocabulary lists, Words to learn, highlighted words, words with definitions,
+     and simple "english = meaning" or "english - meaning" pair lists (very common in Egyptian revision
+     books — these are ALL important and must ALL be extracted, one entry per pair, even with no
+     definition/example/synonym available).
    - IGNORE common simple words, grammar words, and ordinary text.
+   - It is fine, and expected, for "definition", "example", "synonyms", and "antonyms" to be empty
+     when the source is just a word=meaning list — never skip a word just because those fields are missing.
 
 2. For each word extract:
    - word (the English word)
@@ -92,10 +97,13 @@ Example format:
 ]
 """
 
+MAX_INPUT_CHARS = 28000  # room for ~400-word glossary tables without truncation
+
+
 def _call_gemini(text: str) -> str:
     model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(
-        [SYSTEM_PROMPT, f"\n\nText from the book:\n{text[:12000]}"]
+        [SYSTEM_PROMPT, f"\n\nText from the book:\n{text[:MAX_INPUT_CHARS]}"]
     )
     return response.text
 
@@ -105,10 +113,10 @@ def _call_groq(text: str) -> str:
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Text from the book:\n{text[:12000]}"}
+            {"role": "user", "content": f"Text from the book:\n{text[:MAX_INPUT_CHARS]}"}
         ],
         temperature=0.2,
-        max_tokens=4000,
+        max_tokens=8000,
     )
     return completion.choices[0].message.content
 
@@ -263,9 +271,19 @@ def extract_vocabulary_from_pdf(
 
         model = genai.GenerativeModel("gemini-2.0-flash")
         ocr_prompt = (
-            "Extract ALL readable text from this textbook page image. "
-            "Preserve vocabulary lists, definitions, synonyms, antonyms, and examples. "
-            "Output plain text only, no markdown."
+            "This image is a bilingual English-Arabic vocabulary table from a school textbook. "
+            "It may have MULTIPLE side-by-side column blocks per row (e.g. several word/translation "
+            "pairs across the same row, under section headers like 'Part 1', 'Part 2'). "
+            "Extract EVERY word pair you see, reading each column block fully top-to-bottom before "
+            "moving to the next block to the right. For EACH pair output exactly one line:\n"
+            "english_word = الترجمة العربية\n"
+            "Rules:\n"
+            "- One pair per line, nothing else on the line.\n"
+            "- Keep the English word/phrase exactly as written (including phrasal verbs like 'seek to').\n"
+            "- Keep the Arabic translation exactly as written, including any '/' alternatives.\n"
+            "- Do NOT merge two different rows together and do NOT skip any row.\n"
+            "- If a 'Part' or section title appears, output a line: ## Part N\n"
+            "- Output plain text only, no markdown table, no extra commentary."
         )
         parts = []
         ocr_count = 0
@@ -276,7 +294,7 @@ def extract_vocabulary_from_pdf(
                 )
                 break
             page = doc[i]
-            mat = fitz.Matrix(1.5, 1.5)
+            mat = fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             png_bytes = pix.tobytes("png")
             try:

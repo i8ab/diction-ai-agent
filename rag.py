@@ -18,6 +18,23 @@ from typing import List, Dict, Any, Optional, Tuple
 import fitz  # PyMuPDF
 from rank_bm25 import BM25Okapi
 
+
+def _extract_text(response) -> str:
+    """Safely pull the final text out of a Gemini response, ignoring thinking parts."""
+    text = (getattr(response, "text", None) or "").strip()
+    if text:
+        return text
+    try:
+        chunks = []
+        for cand in response.candidates or []:
+            for part in cand.content.parts or []:
+                t = getattr(part, "text", None)
+                if t and not getattr(part, "thought", False):
+                    chunks.append(t)
+        return "\n".join(chunks).strip()
+    except Exception:
+        return ""
+
 # ====================== Paths ======================
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 BOOKS_DIR = DATA_DIR / "books"
@@ -136,9 +153,13 @@ def extract_full_text_from_pdf(
                         types.Part.from_text(text=ocr_prompt),
                         types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
                     ],
-                    config=types.GenerateContentConfig(temperature=0.1),
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=4000,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
                 )
-                page_text = (response.text or "").strip()
+                page_text = _extract_text(response)
                 if page_text:
                     parts.append(f"--- Page {i+1} ---\n{page_text}")
             except Exception as ex:
@@ -333,8 +354,12 @@ def generate_answer(prompt: str) -> str:
         response = client.models.generate_content(
             model=gemini_model,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=1500),
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=3000,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
         )
-        return (response.text or "").strip()
+        return _extract_text(response)
 
     raise Exception("No LLM provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.")

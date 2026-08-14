@@ -23,6 +23,23 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+
+def _extract_text(response) -> str:
+    """Safely pull the final text out of a Gemini response, ignoring thinking parts."""
+    text = (getattr(response, "text", None) or "").strip()
+    if text:
+        return text
+    try:
+        chunks = []
+        for cand in response.candidates or []:
+            for part in cand.content.parts or []:
+                t = getattr(part, "text", None)
+                if t and not getattr(part, "thought", False):
+                    chunks.append(t)
+        return "\n".join(chunks).strip()
+    except Exception:
+        return ""
+
 # ====================== Prompt ======================
 SYSTEM_PROMPT = """You are an expert English vocabulary extractor for school textbooks.
 
@@ -109,9 +126,11 @@ def _call_gemini(text: str) -> str:
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.2,
+            max_output_tokens=8000,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
-    return response.text or ""
+    return _extract_text(response)
 
 
 def _call_groq(text: str) -> str:
@@ -215,9 +234,13 @@ def _ocr_page_with_gemini(png_bytes: bytes) -> str:
             types.Part.from_text(text=OCR_PROMPT),
             types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
         ],
-        config=types.GenerateContentConfig(temperature=0.1),
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=4000,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
     )
-    return (response.text or "").strip()
+    return _extract_text(response)
 
 
 def _ocr_pages_with_gemini(doc, max_pages: int = 20) -> str:

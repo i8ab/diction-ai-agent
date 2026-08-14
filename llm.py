@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import time
 import logging
 from typing import List, Dict, Any
 
@@ -26,6 +27,35 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+def _gemini_generate_with_retry(max_retries: int = 4, base_delay: float = 2.0, **kwargs):
+    """Call gemini_client.models.generate_content with retry on transient errors
+    (503 UNAVAILABLE / 429 rate limit / 500 internal) using exponential backoff."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return gemini_client.models.generate_content(**kwargs)
+        except Exception as e:
+            status = getattr(e, "code", None) or getattr(e, "status_code", None)
+            msg = str(e)
+            transient = (
+                status in (429, 500, 503)
+                or "UNAVAILABLE" in msg
+                or "RESOURCE_EXHAUSTED" in msg
+                or "overloaded" in msg.lower()
+                or "high demand" in msg.lower()
+            )
+            last_err = e
+            if not transient or attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "Gemini call failed (attempt %d/%d, transient=%s): %s — retrying in %.1fs",
+                attempt + 1, max_retries, transient, msg, delay,
+            )
+            time.sleep(delay)
+    raise last_err
 
 
 def _extract_text(response) -> str:
@@ -122,7 +152,7 @@ MAX_INPUT_CHARS = 28000  # room for ~400-word glossary tables without truncation
 def _call_gemini(text: str) -> str:
     if not gemini_client:
         raise Exception("GEMINI_API_KEY not configured")
-    response = gemini_client.models.generate_content(
+    response = _gemini_generate_with_retry(
         model=GEMINI_MODEL,
         contents=f"Text from the book:\n{text[:MAX_INPUT_CHARS]}",
         config=types.GenerateContentConfig(
@@ -291,7 +321,7 @@ OCR_PROMPT = (
 
 
 def _ocr_page_with_gemini(png_bytes: bytes) -> str:
-    response = gemini_client.models.generate_content(
+    response = _gemini_generate_with_retry(
         model=GEMINI_MODEL,
         contents=[
             types.Part.from_text(text=OCR_PROMPT),

@@ -19,6 +19,31 @@ import fitz  # PyMuPDF
 from rank_bm25 import BM25Okapi
 
 
+def _gemini_generate_with_retry(client, max_retries: int = 4, base_delay: float = 2.0, **kwargs):
+    """Call client.models.generate_content with retry on transient errors
+    (503 UNAVAILABLE / 429 rate limit / 500 internal) using exponential backoff."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as e:
+            status = getattr(e, "code", None) or getattr(e, "status_code", None)
+            msg = str(e)
+            transient = (
+                status in (429, 500, 503)
+                or "UNAVAILABLE" in msg
+                or "RESOURCE_EXHAUSTED" in msg
+                or "overloaded" in msg.lower()
+                or "high demand" in msg.lower()
+            )
+            last_err = e
+            if not transient or attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            time.sleep(delay)
+    raise last_err
+
+
 def _extract_text(response) -> str:
     """Safely pull the final text out of a Gemini response, ignoring thinking parts."""
     text = (getattr(response, "text", None) or "").strip()
@@ -147,7 +172,8 @@ def extract_full_text_from_pdf(
             pix = page.get_pixmap(matrix=mat, alpha=False)
             png_bytes = pix.tobytes("png")
             try:
-                response = client.models.generate_content(
+                response = _gemini_generate_with_retry(
+                    client,
                     model=gemini_model,
                     contents=[
                         types.Part.from_text(text=ocr_prompt),
@@ -351,7 +377,8 @@ def generate_answer(prompt: str) -> str:
         from google.genai import types
         client = genai.Client(api_key=gemini_key)
         gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-        response = client.models.generate_content(
+        response = _gemini_generate_with_retry(
+            client,
             model=gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(

@@ -1,164 +1,172 @@
-"""
-LLM helpers for vocabulary extraction.
-Supports Gemini (primary) and Groq (backup).
-"""
-
 import os
 import json
-import re
+import io
 from typing import List, Dict, Any
 
-from dotenv import load_dotenv
-load_dotenv()
+# PDF extraction
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# LLM clients
+import google.generativeai as genai
+from groq import Groq
 
+# ====================== Config ======================
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-SYSTEM_PROMPT = """You are an expert English teacher and lexicographer helping Egyptian students.
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-Your job: From the given English textbook excerpt, extract ONLY the important vocabulary words that students are expected to learn.
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-Rules:
-1. Extract only KEY / important words (words that appear in vocabulary lists, are highlighted, defined, or are clearly the focus of the lesson). Do NOT extract every word.
-2. For each word provide:
-   - word (English)
-   - meaning (Arabic translation suitable for the context)
-   - pos (part of speech if clear: noun, verb, adjective, adverb...)
-   - definition (short English definition if available in the text)
-   - example (one good example sentence from the text if available)
-   - synonyms: ONLY if a synonym is explicitly mentioned or clearly presented in the text for this word. Otherwise empty list.
-   - antonyms: ONLY if an antonym is explicitly mentioned or clearly presented in the text for this word. Otherwise empty list.
-   - section (e.g. "Vocabulary", "Key Words", "Additional Words", "Reading"...)
+# ====================== Prompt ======================
+SYSTEM_PROMPT = """You are an expert English vocabulary extractor for school textbooks.
+
+Your job:
+1. Extract ONLY important vocabulary words that the textbook intends students to learn.
+   - Look for: Key Words, Vocabulary lists, Words to learn, highlighted words, words with definitions.
+   - IGNORE common simple words, grammar words, and ordinary text.
+
+2. For each word extract:
+   - word (the English word)
+   - meaning (Arabic meaning - always provide a clear Arabic translation even if not written in the book)
+   - pos (part of speech: noun, verb, adjective, adverb...)
+   - definition (English definition if available in the book, otherwise a short clear one)
+   - example (example sentence from the book if exists)
+   - synonyms (ONLY if they appear in the book related to this word)
+   - antonyms (ONLY if they appear in the book related to this word)
    - importance: "key" or "additional"
-   - unit / page if mentioned in the text
 
-3. Arabic meanings must be natural and suitable for school students.
-4. Never invent synonyms or antonyms that are not supported by the text.
-5. Return ONLY a valid JSON array. No extra text, no markdown.
+Rules for synonyms & antonyms:
+- ONLY take them from the book text itself.
+- If the book does not mention any synonym/antonym for the word → return empty list.
+- Do NOT invent synonyms or antonyms.
 
-Output format example:
+Return ONLY a valid JSON array of objects. No markdown, no explanation.
+Example format:
 [
   {
     "word": "abandon",
     "meaning": "يتخلى عن / يهجر",
     "pos": "verb",
-    "definition": "to leave a place, thing, or person forever",
-    "example": "They had to abandon the car.",
-    "examples": [],
+    "definition": "to leave something permanently",
+    "example": "He decided to abandon the project.",
     "synonyms": [{"word": "leave"}, {"word": "desert"}],
     "antonyms": [{"word": "keep"}],
-    "section": "Vocabulary",
-    "importance": "key",
-    "unit": "Unit 3",
-    "page": null
+    "importance": "key"
   }
 ]
 """
 
-
-async def extract_vocabulary(text: str) -> List[Dict[str, Any]]:
-    """Main entry point – uses the configured provider."""
-    if LLM_PROVIDER == "groq":
-        return await _extract_with_groq(text)
-    return await _extract_with_gemini(text)
-
-
-async def _extract_with_gemini(text: str) -> List[Dict[str, Any]]:
-    import google.generativeai as genai
-
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set")
-
-    genai.configure(api_key=GEMINI_API_KEY)
-
-    model = genai.GenerativeModel(
-        model_name="gemini-flash-latest",
-        system_instruction=SYSTEM_PROMPT,
-    )
-
-    # Limit text length to stay safe
-    truncated = text[:12000] if len(text) > 12000 else text
-
-    prompt = f"""Extract the important vocabulary from this English textbook excerpt:
-
----
-{truncated}
----
-
-Return only the JSON array."""
-
+def _call_gemini(text: str) -> str:
+    model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(
-        prompt,
-        generation_config={
-            "temperature": 0.2,
-            "response_mime_type": "application/json",
-        },
+        [SYSTEM_PROMPT, f"\n\nText from the book:\n{text[:12000]}"]
     )
+    return response.text
 
-    return _parse_json_response(response.text)
 
-
-async def _extract_with_groq(text: str) -> List[Dict[str, Any]]:
-    from groq import Groq
-
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY is not set")
-
-    client = Groq(api_key=GROQ_API_KEY)
-
-    truncated = text[:12000] if len(text) > 12000 else text
-
-    completion = client.chat.completions.create(
+def _call_groq(text: str) -> str:
+    completion = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Extract the important vocabulary from this English textbook excerpt:\n\n---\n{truncated}\n---\n\nReturn only the JSON array.",
-            },
+            {"role": "user", "content": f"Text from the book:\n{text[:12000]}"}
         ],
         temperature=0.2,
-        max_tokens=4096,
-        response_format={"type": "json_object"},
+        max_tokens=4000,
     )
-
-    content = completion.choices[0].message.content
-    return _parse_json_response(content)
+    return completion.choices[0].message.content
 
 
-def _parse_json_response(text: str) -> List[Dict[str, Any]]:
-    """Robustly parse JSON from LLM response."""
-    if not text:
+def _clean_json(raw: str) -> List[Dict]:
+    """Extract JSON array from LLM response"""
+    raw = raw.strip()
+    # Remove markdown code blocks if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "entries" in data:
+            return data["entries"]
+        return []
+    except Exception:
+        # Try to find the array
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start != -1 and end > start:
+            try:
+                return json.loads(raw[start:end])
+            except:
+                pass
         return []
 
-    text = text.strip()
 
-    # Remove markdown code fences if present
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
+    if not text or len(text.strip()) < 30:
+        return []
+
+    provider = LLM_PROVIDER
+    raw_response = ""
 
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # Try to find the array inside the text
-        match = re.search(r"\[[\s\S]*\]", text)
-        if match:
-            data = json.loads(match.group(0))
+        if provider == "groq" and groq_client:
+            raw_response = _call_groq(text)
+        elif GEMINI_API_KEY:
+            raw_response = _call_gemini(text)
         else:
-            raise ValueError(f"Could not parse LLM response as JSON: {text[:300]}")
-
-    # Normalize: sometimes the model returns {"entries": [...]} 
-    if isinstance(data, dict):
-        for key in ("entries", "words", "vocabulary", "data"):
-            if key in data and isinstance(data[key], list):
-                data = data[key]
-                break
+            raise Exception("No LLM provider configured")
+    except Exception as e:
+        # fallback
+        if provider == "groq" and GEMINI_API_KEY:
+            raw_response = _call_gemini(text)
+        elif groq_client:
+            raw_response = _call_groq(text)
         else:
-            data = [data]
+            raise e
 
-    if not isinstance(data, list):
-        raise ValueError("Expected a list of entries")
+    entries = _clean_json(raw_response)
+    
+    # basic cleaning
+    cleaned = []
+    for e in entries:
+        if not e.get("word"):
+            continue
+        cleaned.append(e)
+    
+    return cleaned
 
-    return data
+
+def extract_vocabulary_from_pdf(pdf_bytes: bytes, filename: str = "book.pdf") -> List[Dict[str, Any]]:
+    if fitz is None:
+        raise Exception("PyMuPDF (fitz) is not installed")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = ""
+    
+    for page in doc:
+        full_text += page.get_text() + "\n\n"
+    
+    doc.close()
+
+    if len(full_text.strip()) < 50:
+        raise Exception("Could not extract enough text from the PDF. It might be a scanned image.")
+
+    entries = extract_vocabulary_from_text(full_text)
+    
+    # add source info
+    for e in entries:
+        e["source_book"] = filename.replace(".pdf", "")
+        e["page"] = 1  # can be improved later
+    
+    return entries

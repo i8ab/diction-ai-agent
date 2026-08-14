@@ -73,18 +73,18 @@ def generate_id() -> str:
 def adapt_entry(raw: dict, source_book: str = None, unit: str = None, section: str = "en-ar", added_by: str = "ai-agent") -> dict:
     """Convert AI Agent raw output to the exact format used in Supabase entries table"""
     
-    # synonyms / antonyms: convert from [{word: "..."}] to simple list of strings if needed
-    # Looking at your example, you store them as empty arrays. 
-    # We'll store them as list of strings for simplicity (compatible).
+    # synonyms / antonyms as {word} objects so frontend chips render correctly
     def normalize_list(items):
         if not items:
             return []
         result = []
         for item in items:
             if isinstance(item, dict):
-                result.append(item.get("word") or item.get("text") or str(item))
+                w = (item.get("word") or item.get("text") or "").strip()
             else:
-                result.append(str(item))
+                w = str(item).strip()
+            if w:
+                result.append({"word": w})
         return result
 
     now = int(time.time() * 1000)

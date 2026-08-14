@@ -33,7 +33,7 @@ Your job:
 
 2. For each word extract:
    - word (the English word)
-   - meaning (Arabic meaning - always provide a clear Arabic translation even if not written in the book)
+   - meaning (ONE primary Arabic meaning - clear and short)
    - pos (part of speech: noun, verb, adjective, adverb...)
    - definition (English definition if available in the book, otherwise a short clear one)
    - example (example sentence from the book if exists)
@@ -41,10 +41,16 @@ Your job:
    - antonyms (ONLY if they appear in the book related to this word)
    - importance: "key" or "additional"
 
+IMPORTANT - Multiple meanings / POS:
+- If the SAME English word has different parts of speech (e.g. bow as verb = ينحني, bow as noun = قوس), create SEPARATE entries — one per POS.
+- Do NOT merge different POS into one entry.
+- If one POS has several Arabic shades, pick the best primary meaning for that POS (do not stuff many meanings into one field).
+
 Rules for synonyms & antonyms:
 - ONLY take them from the book text itself.
 - If the book does not mention any synonym/antonym for the word → return empty list.
 - Do NOT invent synonyms or antonyms.
+- Return synonyms/antonyms as objects: [{"word": "leave"}, {"word": "desert"}]
 
 Return ONLY a valid JSON array of objects. No markdown, no explanation.
 Example format:

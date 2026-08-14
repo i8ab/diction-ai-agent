@@ -212,7 +212,9 @@ def health():
         "ok": True,
         "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
         "groq_configured": bool(os.getenv("GROQ_API_KEY")),
-        "active_provider": os.getenv("LLM_PROVIDER", "gemini"),
+        "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
+        "active_provider": os.getenv("LLM_PROVIDER", "groq"),
+        "fallback_chain": os.getenv("LLM_FALLBACK_CHAIN") or "groq,gemini,openrouter",
         "books_count": len(list_books()),
         "tutor_enabled": True,
     }
@@ -424,20 +426,12 @@ async def chat(req: ChatRequest):
 
 
 # ====================== Personal Tutor (live context, no storage) ======================
-def _extract_action_from_answer(answer: str) -> Optional[str]:
+def _extract_action_from_answer(answer: str, question: str = "") -> Optional[str]:
     """
-    Parse optional machine hint from the model:
+    Parse optional machine hint from the model, or infer from the user question.
       → ACTION: quiz_weak
-      → ACTION: flashcards_all
-    etc. Returns the action token or None.
     """
-    if not answer:
-        return None
     import re
-    m = re.search(r"(?:→\s*)?ACTION:\s*([a-z0-9_]+)", answer, re.IGNORECASE)
-    if not m:
-        return None
-    action = m.group(1).lower().strip()
     allowed = {
         "quiz_weak",
         "quiz_all",
@@ -445,7 +439,25 @@ def _extract_action_from_answer(answer: str) -> Optional[str]:
         "flashcards_all",
         "flashcards_recent",
     }
-    return action if action in allowed else None
+    if answer:
+        m = re.search(r"(?:→\s*)?ACTION:\s*([a-z0-9_]+)", answer, re.IGNORECASE)
+        if m:
+            action = m.group(1).lower().strip()
+            if action in allowed:
+                return action
+
+    blob = f"{question or ''}\n{answer or ''}".lower()
+    wants_quiz = bool(re.search(r"كويز|اختبار|\bquiz\b|\btest\b", blob))
+    wants_flash = bool(re.search(r"فلاش\s*كارد|بطاقات|flash\s*cards?|flashcards", blob))
+    wants_weak = bool(re.search(r"ضعيف|الضعف|\bweak\b", blob))
+    wants_recent = bool(re.search(r"حديث|أخيرة|\brecent\b", blob))
+    if wants_quiz:
+        return "quiz_weak" if wants_weak else "quiz_all"
+    if wants_flash:
+        if wants_recent:
+            return "flashcards_recent"
+        return "flashcards_weak" if wants_weak else "flashcards_all"
+    return None
 
 
 @app.post("/tutor-chat", dependencies=[Depends(verify_secret)])
@@ -480,7 +492,7 @@ async def tutor_chat(req: TutorChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
 
-    action = _extract_action_from_answer(answer)
+    action = _extract_action_from_answer(answer, question)
 
     return {
         "success": True,

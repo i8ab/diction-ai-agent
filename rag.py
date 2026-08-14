@@ -353,16 +353,38 @@ def build_chat_prompt(query: str, contexts: List[str], language_hint: str = "aut
 
 
 def generate_answer(prompt: str, system_message: str = None) -> str:
-    """Call the configured LLM with automatic fallback on rate limits."""
-    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    """
+    Call LLMs in a configurable fallback chain.
+    Env:
+      LLM_FALLBACK_CHAIN=groq,gemini,openrouter
+      GROQ_API_KEY / GROQ_MODEL / GROQ_FALLBACK_MODEL
+      GEMINI_API_KEY / GEMINI_MODEL
+      OPENROUTER_API_KEY / OPENROUTER_MODEL
+      LLM_PROVIDER=groq|gemini|openrouter  (used if chain not set)
+    """
     groq_key = os.getenv("GROQ_API_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
     sys_msg = system_message or (
         "You are a helpful educational assistant. Answer only from the provided book context."
     )
-    # Prefer a fast model with higher rate limits for chat; allow override via env.
     groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
     groq_fallback_model = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.3-70b-versatile")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")
+
+    def _is_rate_limit(err: Exception) -> bool:
+        msg = str(err).lower()
+        return (
+            "429" in msg
+            or "rate_limit" in msg
+            or "rate limit" in msg
+            or "tokens per day" in msg
+            or "tpm" in msg
+            or "tpd" in msg
+            or "resource_exhausted" in msg
+            or "quota" in msg
+        )
 
     def _call_groq(model: str) -> str:
         from groq import Groq
@@ -376,13 +398,12 @@ def generate_answer(prompt: str, system_message: str = None) -> str:
             temperature=0.3,
             max_tokens=1200,
         )
-        return response.choices[0].message.content.strip()
+        return (response.choices[0].message.content or "").strip()
 
     def _call_gemini() -> str:
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=gemini_key)
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         full_prompt = prompt if not system_message else f"{system_message}\n\n{prompt}"
         response = _gemini_generate_with_retry(
             client,
@@ -396,59 +417,92 @@ def generate_answer(prompt: str, system_message: str = None) -> str:
         )
         return _extract_text(response)
 
-    def _is_rate_limit(err: Exception) -> bool:
-        msg = str(err).lower()
-        return (
-            "429" in msg
-            or "rate_limit" in msg
-            or "rate limit" in msg
-            or "tokens per day" in msg
-            or "tpm" in msg
-            or "tpd" in msg
-            or "resource_exhausted" in msg
+    def _call_openrouter() -> str:
+        """OpenAI-compatible API — one key, many models."""
+        import urllib.request
+        import json as _json
+        body = _json.dumps({
+            "model": openrouter_model,
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1200,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://test-diction.vercel.app"),
+                "X-Title": os.getenv("OPENROUTER_TITLE", "Bacaloria Study Coach"),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            # urllib errors often wrap HTTPError with body
+            body_txt = ""
+            if hasattr(e, "read"):
+                try:
+                    body_txt = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            raise Exception(f"OpenRouter error: {e} {body_txt}") from e
+        choices = data.get("choices") or []
+        if not choices:
+            raise Exception(f"OpenRouter empty response: {data}")
+        return (choices[0].get("message", {}).get("content") or "").strip()
+
+    # Build ordered chain from env
+    chain_raw = (os.getenv("LLM_FALLBACK_CHAIN") or "").strip()
+    if chain_raw:
+        chain = [p.strip().lower() for p in chain_raw.split(",") if p.strip()]
+    else:
+        primary = (os.getenv("LLM_PROVIDER") or "groq").lower()
+        defaults = ["groq", "gemini", "openrouter"]
+        chain = [primary] + [p for p in defaults if p != primary]
+
+    # Expand "groq" into fast then strong model steps
+    steps = []  # list of (name, callable)
+    for p in chain:
+        if p == "groq" and groq_key:
+            steps.append((f"groq:{groq_model}", lambda m=groq_model: _call_groq(m)))
+            if groq_fallback_model and groq_fallback_model != groq_model:
+                steps.append((f"groq:{groq_fallback_model}", lambda m=groq_fallback_model: _call_groq(m)))
+        elif p == "gemini" and gemini_key:
+            steps.append(("gemini", _call_gemini))
+        elif p in ("openrouter", "or") and openrouter_key:
+            steps.append(("openrouter", _call_openrouter))
+
+    if not steps:
+        raise Exception(
+            "No LLM provider configured. Set GROQ_API_KEY and/or GEMINI_API_KEY "
+            "and/or OPENROUTER_API_KEY."
         )
 
     errors = []
-
-    # Order: preferred provider first, then the other
-    try_order = []
-    if provider == "gemini":
-        if gemini_key:
-            try_order.append(("gemini", None))
-        if groq_key:
-            try_order.append(("groq", groq_model))
-            try_order.append(("groq", groq_fallback_model))
-    else:
-        if groq_key:
-            try_order.append(("groq", groq_model))
-            try_order.append(("groq", groq_fallback_model))
-        if gemini_key:
-            try_order.append(("gemini", None))
-
-    for kind, model in try_order:
+    for name, fn in steps:
         try:
-            if kind == "groq":
-                return _call_groq(model)
-            return _call_gemini()
+            answer = fn()
+            if answer:
+                return answer
+            errors.append(f"{name}: empty answer")
         except Exception as e:
-            errors.append(f"{kind}:{model or '-'}: {e}")
-            # Always try next provider on rate limit / transient failure
-            if not _is_rate_limit(e) and kind == "gemini":
-                # non-rate gemini failure: still try others if any left
-                continue
+            errors.append(f"{name}: {e}")
             continue
 
-    if errors:
-        # Surface a cleaner message for the client when everything is rate-limited
-        joined = " | ".join(errors)
-        if all(_is_rate_limit(Exception(e)) or "429" in e for e in errors):
-            raise Exception(
-                "تم استهلاك الحد اليومي لنماذج الذكاء الاصطناعي مؤقتًا. "
-                "جرّب بعد شوية أو فعّل Gemini كـ fallback (GEMINI_API_KEY)."
-            )
-        raise Exception(joined)
-
-    raise Exception("No LLM provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.")
+    joined = " | ".join(errors)
+    if errors and all(_is_rate_limit(Exception(e)) or "429" in e for e in errors):
+        raise Exception(
+            "تم استهلاك الحد اليومي لكل محركات الذكاء الاصطناعي المتاحة مؤقتًا. "
+            "جرّب بعد شوية أو أضف مفتاح محرك إضافي (Gemini / OpenRouter)."
+        )
+    raise Exception(joined)
 
 
 

@@ -139,7 +139,7 @@ def root():
     return {
         "service": "Dictionary AI Agent",
         "status": "running",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "llm_provider": os.getenv("LLM_PROVIDER", "gemini")
     }
 
@@ -189,6 +189,8 @@ async def extract_from_pdf(
     unit: Optional[str] = None,
     section: Optional[str] = "en-ar",
     added_by: Optional[str] = "ai-agent",
+    page_from: Optional[int] = 1,
+    page_to: Optional[int] = None,
     x_api_secret: Optional[str] = Header(None)
 ):
     # Manual secret check because File upload makes Depends a bit tricky sometimes
@@ -200,7 +202,13 @@ async def extract_from_pdf(
 
     try:
         content = await file.read()
-        raw_entries = extract_vocabulary_from_pdf(content, filename=file.filename)
+        raw_entries = extract_vocabulary_from_pdf(
+            content,
+            filename=file.filename,
+            page_from=page_from or 1,
+            page_to=page_to,
+            max_ocr_pages=50,
+        )
 
         book_name = source_book or file.filename.replace(".pdf", "")
 
@@ -215,12 +223,15 @@ async def extract_from_pdf(
             for e in raw_entries
         ]
 
+        range_label = f"pages {page_from or 1}" + (f"-{page_to}" if page_to else "+")
         return {
             "success": True,
             "entries": adapted,
             "count": len(adapted),
-            "message": f"Extracted {len(adapted)} entries from PDF ({file.filename})",
-            "provider_used": os.getenv("LLM_PROVIDER", "gemini")
+            "message": f"Extracted {len(adapted)} entries from PDF ({file.filename}, {range_label})",
+            "provider_used": os.getenv("LLM_PROVIDER", "gemini"),
+            "page_from": page_from or 1,
+            "page_to": page_to,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

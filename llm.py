@@ -177,26 +177,141 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
     return cleaned
 
 
-def extract_vocabulary_from_pdf(pdf_bytes: bytes, filename: str = "book.pdf") -> List[Dict[str, Any]]:
+def _ocr_pages_with_gemini(doc, max_pages: int = 20) -> str:
+    """Render PDF pages to images and extract text via Gemini Vision (scanned books)."""
+    if not GEMINI_API_KEY:
+        raise Exception(
+            "This PDF looks scanned (image-only). OCR needs GEMINI_API_KEY to be configured."
+        )
+
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    ocr_prompt = (
+        "Extract ALL readable text from this textbook page image. "
+        "Preserve vocabulary lists, definitions, synonyms, antonyms, and examples. "
+        "Output plain text only, no markdown."
+    )
+
+    parts_text = []
+    n = min(len(doc), max_pages)
+    for i in range(n):
+        page = doc[i]
+        mat = fitz.Matrix(1.5, 1.5)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        png_bytes = pix.tobytes("png")
+
+        try:
+            response = model.generate_content(
+                [
+                    ocr_prompt,
+                    {"mime_type": "image/png", "data": png_bytes},
+                ]
+            )
+            page_text = (response.text or "").strip()
+            if page_text:
+                parts_text.append(f"--- Page {i + 1} ---\n{page_text}")
+        except Exception as ex:
+            parts_text.append(f"--- Page {i + 1} (OCR failed: {ex}) ---")
+
+    if len(doc) > max_pages:
+        parts_text.append(
+            f"\n[Note: only first {max_pages} of {len(doc)} pages were OCR'd]"
+        )
+
+    return "\n\n".join(parts_text)
+
+
+def extract_vocabulary_from_pdf(
+    pdf_bytes: bytes,
+    filename: str = "book.pdf",
+    page_from: int = 1,
+    page_to: int = None,
+    max_ocr_pages: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Extract vocabulary from a PDF.
+    page_from / page_to are 1-based inclusive page numbers.
+    For scanned PDFs, OCR is limited to max_ocr_pages within that range.
+    """
     if fitz is None:
         raise Exception("PyMuPDF (fitz) is not installed")
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = len(doc)
+
+    start = max(1, int(page_from or 1))
+    end = int(page_to) if page_to else total
+    end = min(max(start, end), total)
+    start_idx = start - 1
+
+    if start > total:
+        doc.close()
+        raise Exception(f"page_from ({start}) is beyond PDF length ({total} pages)")
+
     full_text = ""
-    
-    for page in doc:
-        full_text += page.get_text() + "\n\n"
-    
+    for i in range(start_idx, end):
+        full_text += doc[i].get_text() + "\n\n"
+
+    text_len = len(full_text.strip())
+    used_ocr = False
+
+    if text_len < 80:
+        if not GEMINI_API_KEY:
+            doc.close()
+            raise Exception(
+                "This PDF looks scanned (image-only). OCR needs GEMINI_API_KEY."
+            )
+
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        ocr_prompt = (
+            "Extract ALL readable text from this textbook page image. "
+            "Preserve vocabulary lists, definitions, synonyms, antonyms, and examples. "
+            "Output plain text only, no markdown."
+        )
+        parts = []
+        ocr_count = 0
+        for i in range(start_idx, end):
+            if ocr_count >= max_ocr_pages:
+                parts.append(
+                    f"[Stopped OCR at {max_ocr_pages} pages within selected range]"
+                )
+                break
+            page = doc[i]
+            mat = fitz.Matrix(1.5, 1.5)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            png_bytes = pix.tobytes("png")
+            try:
+                response = model.generate_content(
+                    [
+                        ocr_prompt,
+                        {"mime_type": "image/png", "data": png_bytes},
+                    ]
+                )
+                page_text = (response.text or "").strip()
+                if page_text:
+                    parts.append("--- Page %d ---\n%s" % (i + 1, page_text))
+            except Exception as ex:
+                parts.append("--- Page %d (OCR failed: %s) ---" % (i + 1, ex))
+            ocr_count += 1
+
+        full_text = "\n\n".join(parts)
+        used_ocr = True
+
     doc.close()
 
     if len(full_text.strip()) < 50:
-        raise Exception("Could not extract enough text from the PDF. It might be a scanned image.")
+        raise Exception(
+            "Could not extract text from this PDF (even with OCR). "
+            "Try a clearer scan, a smaller page range, or a text-based PDF."
+        )
 
     entries = extract_vocabulary_from_text(full_text)
-    
-    # add source info
+
+    book_name = filename.replace(".pdf", "").replace(".PDF", "")
     for e in entries:
-        e["source_book"] = filename.replace(".pdf", "")
-        e["page"] = 1  # can be improved later
-    
+        e["source_book"] = book_name
+        e["page"] = start
+        e["page_range"] = "%d-%d" % (start, end)
+        if used_ocr:
+            e["ocr"] = True
+
     return entries

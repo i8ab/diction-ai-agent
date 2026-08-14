@@ -353,34 +353,36 @@ def build_chat_prompt(query: str, contexts: List[str], language_hint: str = "aut
 
 
 def generate_answer(prompt: str, system_message: str = None) -> str:
-    """Call the configured LLM (Groq preferred for speed/cost)."""
+    """Call the configured LLM with automatic fallback on rate limits."""
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
     groq_key = os.getenv("GROQ_API_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
     sys_msg = system_message or (
         "You are a helpful educational assistant. Answer only from the provided book context."
     )
+    # Prefer a fast model with higher rate limits for chat; allow override via env.
+    groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    groq_fallback_model = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.3-70b-versatile")
 
-    if provider == "groq" and groq_key:
+    def _call_groq(model: str) -> str:
         from groq import Groq
         client = Groq(api_key=groq_key)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=model,
             messages=[
                 {"role": "system", "content": sys_msg},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
-            max_tokens=1500,
+            max_tokens=1200,
         )
         return response.choices[0].message.content.strip()
 
-    if gemini_key:
+    def _call_gemini() -> str:
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=gemini_key)
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-        # For Gemini we prepend system guidance into the prompt when a custom one is given
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         full_prompt = prompt if not system_message else f"{system_message}\n\n{prompt}"
         response = _gemini_generate_with_retry(
             client,
@@ -388,13 +390,66 @@ def generate_answer(prompt: str, system_message: str = None) -> str:
             contents=full_prompt,
             config=types.GenerateContentConfig(
                 temperature=0.3,
-                max_output_tokens=3000,
+                max_output_tokens=2000,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         return _extract_text(response)
 
+    def _is_rate_limit(err: Exception) -> bool:
+        msg = str(err).lower()
+        return (
+            "429" in msg
+            or "rate_limit" in msg
+            or "rate limit" in msg
+            or "tokens per day" in msg
+            or "tpm" in msg
+            or "tpd" in msg
+            or "resource_exhausted" in msg
+        )
+
+    errors = []
+
+    # Order: preferred provider first, then the other
+    try_order = []
+    if provider == "gemini":
+        if gemini_key:
+            try_order.append(("gemini", None))
+        if groq_key:
+            try_order.append(("groq", groq_model))
+            try_order.append(("groq", groq_fallback_model))
+    else:
+        if groq_key:
+            try_order.append(("groq", groq_model))
+            try_order.append(("groq", groq_fallback_model))
+        if gemini_key:
+            try_order.append(("gemini", None))
+
+    for kind, model in try_order:
+        try:
+            if kind == "groq":
+                return _call_groq(model)
+            return _call_gemini()
+        except Exception as e:
+            errors.append(f"{kind}:{model or '-'}: {e}")
+            # Always try next provider on rate limit / transient failure
+            if not _is_rate_limit(e) and kind == "gemini":
+                # non-rate gemini failure: still try others if any left
+                continue
+            continue
+
+    if errors:
+        # Surface a cleaner message for the client when everything is rate-limited
+        joined = " | ".join(errors)
+        if all(_is_rate_limit(Exception(e)) or "429" in e for e in errors):
+            raise Exception(
+                "تم استهلاك الحد اليومي لنماذج الذكاء الاصطناعي مؤقتًا. "
+                "جرّب بعد شوية أو فعّل Gemini كـ fallback (GEMINI_API_KEY)."
+            )
+        raise Exception(joined)
+
     raise Exception("No LLM provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.")
+
 
 
 # ====================== Personal Tutor (user progress, no storage) ======================

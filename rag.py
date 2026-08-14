@@ -518,15 +518,12 @@ def build_tutor_prompt(
 3) جاوب بنفس لغة سؤال المستخدم (عربي أو إنجليزي).
 4) كن مختصرًا وواضحًا ومشجعًا، ومناسب لطالب بيذاكر مفردات.
 5) لو سأل عن الكلمات الضعيفة أو اللي محتاج يركز عليها: اعتمد على قائمة "الكلمات الضعيفة" في الملخص. لو القائمة فاضية، قول كده بصراحة.
-6) لو طلب كويز أو فلاش كارد أو مراجعة:
-   - انصحه بطريقة طبيعية.
-   - في آخر الرد أضف سطر واحد بالشكل ده بالظبط عشان التطبيق يقدر يفتح الشاشة المناسبة:
-     → ACTION: quiz_weak
-     أو → ACTION: quiz_all
-     أو → ACTION: flashcards_weak
-     أو → ACTION: flashcards_all
-     أو → ACTION: flashcards_recent
-   استخدم الأكشن الأنسب فقط، ومش لازم تحط أكشن لو السؤال مش طلب فتح أداة.
+6) لو المستخدم طلب صراحة فتح كويز أو فلاش كارد:
+   - جاوب بالنصيحة عادي.
+   - وفي آخر الرد فقط (مش في النص) حط سطر:
+     → ACTION: quiz_weak | quiz_all | flashcards_weak | flashcards_all | flashcards_recent
+   - التطبيق يعرض زر للمستخدم؛ هو اللي يختار يضغط أو لأ. متقولش إنك فتحت حاجة.
+   - لو مجرد سأل عن الضعيف من غير ما يطلب فتح أداة: متضيفش ACTION.
 7) ممنوع تخزن أو تفتكر بيانات من محادثات سابقة غير اللي مبعوتة في "محادثة سابقة". كل طلب مستقل.
 8) لو السؤال عام عن المفردات أو ترجمة ومش متعلق بتقدم المستخدم، جاوب باختصار مفيد أو قول إن تخصصك هنا متابعة تقدمه الدراسي."""
 
@@ -547,7 +544,8 @@ TUTOR_SYSTEM_MESSAGE = (
     "Answer only from the user progress summary provided in the prompt. "
     "If data is missing, say you don't know. "
     "Match the user's language (Arabic or English). "
-    "When suggesting quiz/flashcards, end with a single line like: → ACTION: quiz_weak"
+    "Only if the user explicitly asks to open a quiz or flashcards, end with one line: → ACTION: quiz_weak (or similar). "
+    "Never claim you opened anything — the app shows an optional button the user can tap."
 )
 
 

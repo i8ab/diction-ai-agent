@@ -61,11 +61,19 @@ Your job:
    - word (the English word)
    - meaning (ONE primary Arabic meaning - clear and short)
    - pos (part of speech: noun, verb, adjective, adverb...)
-   - definition (English definition if available in the book, otherwise a short clear one)
-   - example (example sentence from the book if exists)
-   - synonyms (ONLY if they appear in the book related to this word)
-   - antonyms (ONLY if they appear in the book related to this word)
+   - definition: include this field ONLY if the book text you were given literally contains an
+     English definition/explanation for that word. Copy or lightly rephrase it from the book.
+     If the source is just a simple "english = meaning" pair with no definition written anywhere
+     near it, DO NOT include the "definition" field at all — never invent or guess one.
+   - example (ONLY if an example sentence literally appears in the book; otherwise omit the field)
+   - synonyms (ONLY if they appear in the book related to this word; otherwise omit the field)
+   - antonyms (ONLY if they appear in the book related to this word; otherwise omit the field)
    - importance: "key" or "additional"
+
+IMPORTANT — keep the JSON compact:
+- Omit any field you don't have real content for instead of writing empty strings/arrays,
+  EXCEPT "word" and "meaning" which are always required.
+- Do not add "senses" unless the word genuinely has more than one distinct meaning/pos in the book.
 
 IMPORTANT - One entry per English word spelling:
 - Always create ONE object per English word (e.g. one object for "bow", one for "bank").
@@ -86,7 +94,7 @@ Rules for synonyms & antonyms:
 - Return synonyms/antonyms as objects: [{"word": "leave"}, {"word": "desert"}]
 
 Return ONLY a valid JSON array of objects. No markdown, no explanation.
-Example format:
+Example format — "bow" has no definition in the source (omit the field), "bank" does (include it):
 [
   {
     "word": "bow",
@@ -96,23 +104,13 @@ Example format:
       {"pos": "noun", "meaning": "قوس"},
       {"pos": "verb", "meaning": "ينحني"}
     ],
-    "definition": "a curved weapon; or to bend the body in respect",
-    "example": "He bowed to the audience.",
-    "synonyms": [{"word": "bend"}],
-    "antonyms": [],
     "importance": "key"
   },
   {
     "word": "bank",
     "meaning": "بنك",
     "pos": "noun",
-    "senses": [
-      {"pos": "noun", "meaning": "بنك"},
-      {"pos": "noun", "meaning": "ضفة"}
-    ],
-    "definition": "a financial institution; or the side of a river",
-    "synonyms": [],
-    "antonyms": [],
+    "definition": "a financial institution that accepts deposits and lends money",
     "importance": "key"
   }
 ]
@@ -130,7 +128,7 @@ def _call_gemini(text: str) -> str:
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.2,
-            max_output_tokens=8000,
+            max_output_tokens=16000,
             thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
@@ -151,7 +149,7 @@ def _call_groq(text: str) -> str:
 
 
 def _clean_json(raw: str) -> List[Dict]:
-    """Extract JSON array from LLM response"""
+    """Extract JSON array from LLM response, repairing truncated output if needed."""
     raw = raw.strip()
     # Remove markdown code blocks if present
     if raw.startswith("```"):
@@ -160,23 +158,73 @@ def _clean_json(raw: str) -> List[Dict]:
             raw = raw[4:]
     raw = raw.strip()
 
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "entries" in data:
-            return data["entries"]
-        return []
-    except Exception:
-        # Try to find the array
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        if start != -1 and end > start:
-            try:
-                return json.loads(raw[start:end])
-            except Exception:
-                pass
-        return []
+    def _try_parse(s: str):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and "entries" in data:
+                return data["entries"]
+        except Exception:
+            return None
+        return None
+
+    result = _try_parse(raw)
+    if result is not None:
+        return result
+
+    start = raw.find("[")
+    end = raw.rfind("]") + 1
+    if start != -1 and end > start:
+        result = _try_parse(raw[start:end])
+        if result is not None:
+            return result
+
+    # Response likely got truncated mid-array (hit max_output_tokens).
+    # Salvage every complete top-level object we can find and drop the
+    # trailing incomplete one instead of losing everything.
+    if start != -1:
+        body = raw[start + 1:]
+        objects = []
+        depth = 0
+        obj_start = None
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(body):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                if depth == 0:
+                    obj_start = idx
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    objects.append(body[obj_start:idx + 1])
+                    obj_start = None
+        salvaged = []
+        for obj_str in objects:
+            parsed = _try_parse("[" + obj_str + "]")
+            if parsed:
+                salvaged.extend(parsed)
+        if salvaged:
+            logger.warning(
+                "_clean_json: response was truncated/malformed — salvaged %d of the "
+                "complete objects found instead of failing entirely", len(salvaged)
+            )
+            return salvaged
+
+    logger.error("_clean_json: could not parse or salvage any entries from LLM response")
+    return []
 
 
 def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:

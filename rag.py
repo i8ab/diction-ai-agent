@@ -153,7 +153,7 @@ def extract_full_text_from_pdf(
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=gemini_key)
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
         ocr_prompt = (
             "Extract ALL readable text from this textbook page image. "
@@ -376,7 +376,7 @@ def generate_answer(prompt: str) -> str:
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=gemini_key)
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         response = _gemini_generate_with_retry(
             client,
             model=gemini_model,

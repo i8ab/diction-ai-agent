@@ -1,7 +1,11 @@
 import os
 import json
 import io
+import logging
 from typing import List, Dict, Any
+
+logger = logging.getLogger("diction.llm")
+logging.basicConfig(level=logging.INFO)
 
 # PDF extraction
 try:
@@ -177,7 +181,11 @@ def _clean_json(raw: str) -> List[Dict]:
 
 def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
     if not text or len(text.strip()) < 30:
+        logger.warning("extract_vocabulary_from_text: input text too short (%d chars)", len(text or ""))
         return []
+
+    logger.info("extract_vocabulary_from_text: input length=%d chars, preview=%r",
+                len(text), text[:300])
 
     provider = LLM_PROVIDER
     raw_response = ""
@@ -190,6 +198,7 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
         else:
             raise Exception("No LLM provider configured")
     except Exception as e:
+        logger.warning("extract_vocabulary_from_text: primary provider failed: %s", e)
         # fallback
         if provider == "groq" and gemini_client:
             raw_response = _call_gemini(text)
@@ -198,7 +207,11 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
         else:
             raise e
 
+    logger.info("extract_vocabulary_from_text: raw LLM response length=%d, preview=%r",
+                len(raw_response or ""), (raw_response or "")[:500])
+
     entries = _clean_json(raw_response)
+    logger.info("extract_vocabulary_from_text: parsed %d raw entries from JSON", len(entries))
 
     # basic cleaning
     cleaned = []
@@ -206,6 +219,8 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
         if not e.get("word"):
             continue
         cleaned.append(e)
+
+    logger.info("extract_vocabulary_from_text: %d entries after cleaning", len(cleaned))
 
     return cleaned
 
@@ -328,14 +343,18 @@ def extract_vocabulary_from_pdf(
             png_bytes = pix.tobytes("png")
             try:
                 page_text = _ocr_page_with_gemini(png_bytes)
+                logger.info("OCR page %d: %d chars extracted, preview=%r",
+                            i + 1, len(page_text), page_text[:200])
                 if page_text:
                     parts.append("--- Page %d ---\n%s" % (i + 1, page_text))
             except Exception as ex:
+                logger.exception("OCR failed on page %d", i + 1)
                 parts.append("--- Page %d (OCR failed: %s) ---" % (i + 1, ex))
             ocr_count += 1
 
         full_text = "\n\n".join(parts)
         used_ocr = True
+        logger.info("extract_vocabulary_from_pdf: OCR total full_text length=%d", len(full_text))
 
         if parts and all("(OCR failed" in p for p in parts):
             doc.close()

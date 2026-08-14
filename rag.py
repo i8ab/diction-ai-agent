@@ -415,7 +415,7 @@ def _cap_list(items, limit: int) -> list:
 
 def sanitize_user_context(raw: dict | None) -> dict:
     """
-    Keep only a small, useful summary of the user.
+    Keep only a small, useful summary of the user (all sections).
     Nothing is stored — this is used for the current request only.
     """
     if not raw or not isinstance(raw, dict):
@@ -427,33 +427,54 @@ def sanitize_user_context(raw: dict | None) -> dict:
         MAX_RECENT_WORDS,
     )
 
-    def _num(key_variants, default=0):
+    def _num(src, key_variants, default=0):
         for k in key_variants:
-            if k in raw and raw[k] is not None:
+            if k in src and src[k] is not None:
                 try:
-                    return int(raw[k])
+                    return int(src[k])
                 except (TypeError, ValueError):
                     try:
-                        return int(float(raw[k]))
+                        return int(float(src[k]))
                     except (TypeError, ValueError):
                         pass
         return default
 
+    sections_out = {}
+    raw_sections = raw.get("sections") if isinstance(raw.get("sections"), dict) else {}
+    for sk, sv in raw_sections.items():
+        if not isinstance(sv, dict):
+            continue
+        sec_weak = _cap_list(sv.get("weak_words") or [], 8)
+        sec = {
+            "label": str(sv.get("label") or sk),
+            "in_dictionary": _num(sv, ["in_dictionary", "total", "count"]),
+            "studied": _num(sv, ["studied", "studied_count"]),
+            "not_studied": _num(sv, ["not_studied", "unstudied"]),
+            "mastered": _num(sv, ["mastered"]),
+            "weak": _num(sv, ["weak", "weak_count"], len(sec_weak)),
+            "weak_words": sec_weak,
+        }
+        if sec["in_dictionary"] or sec["studied"] or sec["not_studied"]:
+            sections_out[str(sk)] = sec
+
     ctx = {
         "name": str(raw.get("name") or raw.get("user_name") or "").strip() or None,
-        "total_words": _num(["total_words", "totalWords", "total"]),
-        "mastered": _num(["mastered", "mastered_count", "masteredCount"]),
-        "learning": _num(["learning", "learning_count", "learningCount"]),
-        "weak_count": _num(["weak", "weak_count", "weakCount"], len(weak)),
-        "today_studied": _num(["today_studied", "todayStudied", "today_count"]),
-        "streak": _num(["streak", "current_streak"]),
-        "level": _num(["level", "xp_level", "xpLevel"]),
+        "total_in_dictionary": _num(raw, ["total_in_dictionary", "dictionary_total"]),
+        "total_words": _num(raw, ["total_words", "totalWords", "total"]),
+        "not_studied": _num(raw, ["not_studied", "unstudied", "remaining"]),
+        "mastered": _num(raw, ["mastered", "mastered_count", "masteredCount"]),
+        "learning": _num(raw, ["learning", "learning_count", "learningCount"]),
+        "weak_count": _num(raw, ["weak", "weak_count", "weakCount"], len(weak)),
+        "today_studied": _num(raw, ["today_studied", "todayStudied", "today_count"]),
+        "streak": _num(raw, ["streak", "current_streak"]),
+        "level": _num(raw, ["level", "xp_level", "xpLevel"]),
         "weak_words": weak,
         "recent_words": recent,
         "last_activity": str(raw.get("last_activity") or raw.get("lastActivity") or "").strip() or None,
+        "sections": sections_out or None,
     }
-    # Drop empty / zero-noise fields to keep the prompt lean
     return {k: v for k, v in ctx.items() if v not in (None, "", [], 0)}
+
 
 
 def build_tutor_prompt(
@@ -467,12 +488,15 @@ def build_tutor_prompt(
     """
     ctx = sanitize_user_context(user_context)
 
-    # Compact human-readable block
     lines = []
     if ctx.get("name"):
         lines.append(f"- الاسم: {ctx['name']}")
+    if "total_in_dictionary" in ctx:
+        lines.append(f"- إجمالي الكلمات في القاموس (كل الأقسام): {ctx['total_in_dictionary']}")
     if "total_words" in ctx:
-        lines.append(f"- إجمالي الكلمات: {ctx['total_words']}")
+        lines.append(f"- مُذاكرة (studied) إجمالي: {ctx['total_words']}")
+    if "not_studied" in ctx:
+        lines.append(f"- لسه متذاكرتش (not studied): {ctx['not_studied']}")
     if "mastered" in ctx:
         lines.append(f"- متقنة (mastered): {ctx['mastered']}")
     if "learning" in ctx:
@@ -480,7 +504,7 @@ def build_tutor_prompt(
     if "weak_count" in ctx:
         lines.append(f"- عدد الكلمات الضعيفة: {ctx['weak_count']}")
     if "today_studied" in ctx:
-        lines.append(f"- ذاكر اليوم: {ctx['today_studied']} كلمة")
+        lines.append(f"- ذاكر النهاردة: {ctx['today_studied']} كلمة")
     if "streak" in ctx:
         lines.append(f"- سلسلة الأيام (streak): {ctx['streak']}")
     if "level" in ctx:
@@ -488,13 +512,32 @@ def build_tutor_prompt(
     if ctx.get("last_activity"):
         lines.append(f"- آخر نشاط: {ctx['last_activity']}")
     if ctx.get("weak_words"):
-        lines.append("- عينة من الكلمات الضعيفة: " + ", ".join(ctx["weak_words"]))
+        lines.append("- عينة كلمات ضعيفة (كل الأقسام): " + ", ".join(ctx["weak_words"]))
     if ctx.get("recent_words"):
         lines.append("- كلمات حديثة: " + ", ".join(ctx["recent_words"]))
 
+    # Per-section breakdown
+    sections = ctx.get("sections") or {}
+    if isinstance(sections, dict) and sections:
+        lines.append("- تفصيل حسب القسم:")
+        for sk, sv in sections.items():
+            if not isinstance(sv, dict):
+                continue
+            label = sv.get("label") or sk
+            part = (
+                f"  • {label}: في القاموس={sv.get('in_dictionary', 0)}, "
+                f"مذاكر={sv.get('studied', 0)}, "
+                f"مش مذاكر={sv.get('not_studied', 0)}, "
+                f"متقن={sv.get('mastered', 0)}, "
+                f"ضعيف={sv.get('weak', 0)}"
+            )
+            ww = sv.get("weak_words") or []
+            if ww:
+                part += " | ضعيف منها: " + ", ".join(ww)
+            lines.append(part)
+
     context_block = "\n".join(lines) if lines else "(لا توجد بيانات تقدم مرسلة مع هذا الطلب)"
 
-    # Optional short history (client-side only)
     history_block = ""
     if history and isinstance(history, list):
         turns = []
@@ -510,26 +553,29 @@ def build_tutor_prompt(
         if turns:
             history_block = "\n\nمحادثة سابقة (مختصرة):\n" + "\n".join(turns)
 
-    system_rules = """أنت مساعد دراسة شخصي ذكي لتطبيق قاموس/مفردات (Two Tongues / Bacaloria).
+    system_rules = """أنت مساعد دراسة شخصي لتطبيق قاموس مفردات (Bacaloria / Two Tongues).
 
-قواعد مهمة جدًا:
-1) استخدم فقط معلومات تقدم المستخدم الموجودة في "ملخص حالة المستخدم" أدناه. لا تخترع أرقام أو كلمات غير موجودة هناك.
-2) لو المعلومة مش موجودة في الملخص، قول بصراحة إنك مش عارف أو إن البيانات دي مش متاحة دلوقتي (مثلاً: "مش عندي المعلومة دي في البيانات الحالية").
-3) جاوب بنفس لغة سؤال المستخدم (عربي أو إنجليزي).
-4) كن مختصرًا وواضحًا ومشجعًا، ومناسب لطالب بيذاكر مفردات.
-5) لو سأل عن الكلمات الضعيفة أو اللي محتاج يركز عليها: اعتمد على قائمة "الكلمات الضعيفة" في الملخص. لو القائمة فاضية، قول كده بصراحة.
-6) لو المستخدم طلب صراحة فتح كويز أو فلاش كارد:
-   - جاوب بالنصيحة عادي.
-   - وفي آخر الرد فقط (مش في النص) حط سطر:
-     → ACTION: quiz_weak | quiz_all | flashcards_weak | flashcards_all | flashcards_recent
-   - التطبيق يعرض زر للمستخدم؛ هو اللي يختار يضغط أو لأ. متقولش إنك فتحت حاجة.
-   - لو مجرد سأل عن الضعيف من غير ما يطلب فتح أداة: متضيفش ACTION.
-7) ممنوع تخزن أو تفتكر بيانات من محادثات سابقة غير اللي مبعوتة في "محادثة سابقة". كل طلب مستقل.
-8) لو السؤال عام عن المفردات أو ترجمة ومش متعلق بتقدم المستخدم، جاوب باختصار مفيد أو قول إن تخصصك هنا متابعة تقدمه الدراسي."""
+أسلوب الرد:
+- لو السؤال بالعامية المصرية أو العربي، ارد بعربي بسيط وطبيعي (مش فصحى متكلفة، ومش إنجليزي مخلوط من غير داعي).
+- لو السؤال بالإنجليزي، ارد بالإنجليزي.
+- جمل قصيرة وواضحة. متستخدمش كلمات غريبة أو ترجمة حرفية.
+
+القواعد:
+1) اعتمد فقط على "ملخص حالة المستخدم" أدناه. متخترعش أرقام أو أقسام مش موجودة.
+2) القاموس فيه أقسام منفصلة: Academic، EN→AR، AR→AR. لما تسأل عن قسم معيّن استخدم أرقام القسم ده من التفصيل. لما السؤال عام استخدم الإجمالي.
+3) "مذاكر / studied" = كلمات علّم عليها المستخدم إنها اتذاكرت.
+   "مش مذاكر / not studied" = باقي كلمات القاموس لسه متتعلمش.
+   لو سأل "كام كلمة لسه متذاكرتش؟" جاوب برقم not_studied (والتفصيل حسب القسم لو طلب).
+4) لو المعلومة مش في الملخص، قول ببساطة: "مش عندي المعلومة دي في البيانات الحالية".
+5) متقولش إن البيانات "في قاموس الإنجليزي فقط" إلا لو الملخص فعلًا عن قسم واحد. عندك تفصيل كل الأقسام.
+6) لو طلب فتح كويز أو فلاش كارد بصراحة: انصحه، وفي آخر سطر فقط:
+   → ACTION: quiz_weak | quiz_all | flashcards_weak | flashcards_all | flashcards_recent
+   متقولش إنك فتحت حاجة — التطبيق بيعرض زر والمستخدم يختار.
+7) كل طلب مستقل؛ متعتمدش على ذاكرة غير "محادثة سابقة" المرفقة."""
 
     return f"""{system_rules}
 
-ملخص حالة المستخدم (لحظي، من هذا الطلب فقط):
+ملخص حالة المستخدم (لحظي — كل الأقسام):
 {context_block}
 {history_block}
 
@@ -539,13 +585,16 @@ def build_tutor_prompt(
 الإجابة:"""
 
 
+
 TUTOR_SYSTEM_MESSAGE = (
-    "You are a personal vocabulary study coach. "
-    "Answer only from the user progress summary provided in the prompt. "
-    "If data is missing, say you don't know. "
-    "Match the user's language (Arabic or English). "
-    "Only if the user explicitly asks to open a quiz or flashcards, end with one line: → ACTION: quiz_weak (or similar). "
-    "Never claim you opened anything — the app shows an optional button the user can tap."
+    "You are a personal vocabulary study coach for an Arabic/English dictionary app. "
+    "Answer ONLY from the progress summary in the prompt (all sections: Academic, EN→AR, AR→AR). "
+    "If the user writes Egyptian Arabic or Arabic, reply in simple natural Arabic (not stiff formal, not weird mixed English). "
+    "If they write English, reply in English. "
+    "Clearly distinguish studied vs not-studied counts. "
+    "If data is missing, say you don't have it. "
+    "Only if they explicitly ask to open quiz/flashcards, end with: → ACTION: quiz_weak (or similar). "
+    "Never claim you opened anything."
 )
 
 

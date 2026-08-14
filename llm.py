@@ -257,14 +257,8 @@ def _clean_json(raw: str) -> List[Dict]:
     return []
 
 
-def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
-    if not text or len(text.strip()) < 30:
-        logger.warning("extract_vocabulary_from_text: input text too short (%d chars)", len(text or ""))
-        return []
-
-    logger.info("extract_vocabulary_from_text: input length=%d chars, preview=%r",
-                len(text), text[:300])
-
+def _extract_vocabulary_single_batch(text: str) -> List[Dict[str, Any]]:
+    """Run one LLM call over a chunk of text small enough to avoid output truncation."""
     provider = LLM_PROVIDER
     raw_response = ""
 
@@ -276,7 +270,7 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
         else:
             raise Exception("No LLM provider configured")
     except Exception as e:
-        logger.warning("extract_vocabulary_from_text: primary provider failed: %s", e)
+        logger.warning("_extract_vocabulary_single_batch: primary provider failed: %s", e)
         # fallback
         if provider == "groq" and gemini_client:
             raw_response = _call_gemini(text)
@@ -285,22 +279,86 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
         else:
             raise e
 
-    logger.info("extract_vocabulary_from_text: raw LLM response length=%d, preview=%r",
+    logger.info("_extract_vocabulary_single_batch: raw LLM response length=%d, preview=%r",
                 len(raw_response or ""), (raw_response or "")[:500])
 
     entries = _clean_json(raw_response)
-    logger.info("extract_vocabulary_from_text: parsed %d raw entries from JSON", len(entries))
+    logger.info("_extract_vocabulary_single_batch: parsed %d raw entries from JSON", len(entries))
 
-    # basic cleaning
     cleaned = []
     for e in entries:
         if not e.get("word"):
             continue
         cleaned.append(e)
 
-    logger.info("extract_vocabulary_from_text: %d entries after cleaning", len(cleaned))
-
     return cleaned
+
+
+# Each batch sent to the LLM is kept small so the model's JSON response never
+# has to describe more than a couple dozen words at once — this is what
+# prevents the response getting cut off mid-array and silently losing words.
+BATCH_CHAR_LIMIT = 3500
+
+
+def _split_into_batches(text: str, batch_char_limit: int = BATCH_CHAR_LIMIT) -> List[str]:
+    """Split text into batches on line boundaries, never breaking a line in half."""
+    lines = text.split("\n")
+    batches = []
+    current: List[str] = []
+    current_len = 0
+
+    for line in lines:
+        # +1 accounts for the newline that will join this line back in
+        line_len = len(line) + 1
+        if current and current_len + line_len > batch_char_limit:
+            batches.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        batches.append("\n".join(current))
+
+    return [b for b in batches if b.strip()]
+
+
+def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
+    if not text or len(text.strip()) < 30:
+        logger.warning("extract_vocabulary_from_text: input text too short (%d chars)", len(text or ""))
+        return []
+
+    logger.info("extract_vocabulary_from_text: input length=%d chars, preview=%r",
+                len(text), text[:300])
+
+    batches = _split_into_batches(text)
+    logger.info("extract_vocabulary_from_text: split input into %d batch(es) of <=%d chars",
+                len(batches), BATCH_CHAR_LIMIT)
+
+    all_entries: List[Dict[str, Any]] = []
+    seen_words = set()
+
+    for i, batch in enumerate(batches):
+        logger.info("extract_vocabulary_from_text: processing batch %d/%d (%d chars)",
+                    i + 1, len(batches), len(batch))
+        try:
+            batch_entries = _extract_vocabulary_single_batch(batch)
+        except Exception as ex:
+            logger.exception("extract_vocabulary_from_text: batch %d/%d failed, skipping it: %s",
+                              i + 1, len(batches), ex)
+            continue
+
+        for e in batch_entries:
+            key = e.get("word", "").strip().lower()
+            if not key or key in seen_words:
+                continue
+            seen_words.add(key)
+            all_entries.append(e)
+
+    logger.info("extract_vocabulary_from_text: %d total entries after merging %d batch(es)",
+                len(all_entries), len(batches))
+
+    return all_entries
 
 
 OCR_PROMPT = (

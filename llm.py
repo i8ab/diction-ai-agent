@@ -157,9 +157,7 @@ def _call_gemini(text: str) -> str:
         contents=f"Text from the book:\n{text[:MAX_INPUT_CHARS]}",
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            temperature=0.2,
             max_output_tokens=16000,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
     return _extract_text(response)
@@ -396,9 +394,7 @@ def _ocr_page_with_gemini(png_bytes: bytes) -> str:
             types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
         ],
         config=types.GenerateContentConfig(
-            temperature=0.1,
             max_output_tokens=4000,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
     return _extract_text(response)

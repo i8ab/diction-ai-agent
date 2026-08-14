@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: diction-ai-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: API_SECRET
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.12.8"

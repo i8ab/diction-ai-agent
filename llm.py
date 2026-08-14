@@ -44,7 +44,13 @@ Your job:
 IMPORTANT - Multiple meanings / POS:
 - If the SAME English word has different parts of speech (e.g. bow as verb = ينحني, bow as noun = قوس), create SEPARATE entries — one per POS.
 - Do NOT merge different POS into one entry.
-- If one POS has several Arabic shades, pick the best primary meaning for that POS (do not stuff many meanings into one field).
+- If ONE POS has several distinct Arabic meanings, put them in a "senses" array instead of joining with slash:
+  "senses": [
+    {"pos": "verb", "meaning": "يتخلى عن"},
+    {"pos": "verb", "meaning": "يهجر"}
+  ]
+  Also set "meaning" to the first sense and "pos" to the first sense pos.
+- Never write multiple Arabic meanings in one string with " / " or " | ".
 
 Rules for synonyms & antonyms:
 - ONLY take them from the book text itself.
@@ -57,12 +63,34 @@ Example format:
 [
   {
     "word": "abandon",
-    "meaning": "يتخلى عن / يهجر",
+    "meaning": "يتخلى عن",
     "pos": "verb",
+    "senses": [
+      {"pos": "verb", "meaning": "يتخلى عن"},
+      {"pos": "verb", "meaning": "يهجر"}
+    ],
     "definition": "to leave something permanently",
     "example": "He decided to abandon the project.",
     "synonyms": [{"word": "leave"}, {"word": "desert"}],
     "antonyms": [{"word": "keep"}],
+    "importance": "key"
+  },
+  {
+    "word": "bow",
+    "meaning": "ينحني",
+    "pos": "verb",
+    "definition": "to bend the head or body",
+    "synonyms": [],
+    "antonyms": [],
+    "importance": "key"
+  },
+  {
+    "word": "bow",
+    "meaning": "قوس",
+    "pos": "noun",
+    "definition": "a weapon for shooting arrows",
+    "synonyms": [],
+    "antonyms": [],
     "importance": "key"
   }
 ]

@@ -89,11 +89,32 @@ def adapt_entry(raw: dict, source_book: str = None, unit: str = None, section: s
 
     now = int(time.time() * 1000)
 
-    return {
+    # senses: multiple Arabic meanings
+    senses_raw = raw.get("senses") or []
+    senses = []
+    if isinstance(senses_raw, list):
+        for s in senses_raw:
+            if not isinstance(s, dict):
+                continue
+            m = str(s.get("meaning") or "").strip()
+            if not m:
+                continue
+            senses.append({
+                "pos": str(s.get("pos") or raw.get("pos") or "").strip(),
+                "meaning": m,
+            })
+
+    meaning = raw.get("meaning", "").strip()
+    pos = raw.get("pos")
+    if senses:
+        meaning = meaning or senses[0]["meaning"]
+        pos = pos or senses[0].get("pos")
+
+    out = {
         "id": generate_id(),
         "word": raw.get("word", "").strip(),
-        "meaning": raw.get("meaning", "").strip(),
-        "pos": raw.get("pos"),
+        "meaning": meaning,
+        "pos": pos,
         "definition": raw.get("definition"),
         "example": raw.get("example"),
         "examples": raw.get("examples") or [],
@@ -102,13 +123,15 @@ def adapt_entry(raw: dict, source_book: str = None, unit: str = None, section: s
         "section": section or "en-ar",
         "addedAt": now,
         "addedBy": added_by or "ai-agent",
-        # extra useful fields
         "source_book": source_book or raw.get("source_book"),
         "unit": unit or raw.get("unit"),
         "page": raw.get("page"),
         "from_ai": True,
-        "importance": raw.get("importance", "key")
+        "importance": raw.get("importance", "key"),
     }
+    if len(senses) > 1:
+        out["senses"] = senses
+    return out
 
 # ====================== Endpoints ======================
 @app.get("/")

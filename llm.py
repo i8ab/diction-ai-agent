@@ -41,16 +41,17 @@ Your job:
    - antonyms (ONLY if they appear in the book related to this word)
    - importance: "key" or "additional"
 
-IMPORTANT - Multiple meanings / POS:
-- If the SAME English word has different parts of speech (e.g. bow as verb = ينحني, bow as noun = قوس), create SEPARATE entries — one per POS.
-- Do NOT merge different POS into one entry.
-- If ONE POS has several distinct Arabic meanings, put them in a "senses" array instead of joining with slash:
+IMPORTANT - One entry per English word spelling:
+- Always create ONE object per English word (e.g. one object for "bow", one for "bank").
+- If the word has multiple meanings or multiple parts of speech, put them ALL in "senses":
   "senses": [
-    {"pos": "verb", "meaning": "يتخلى عن"},
-    {"pos": "verb", "meaning": "يهجر"}
+    {"pos": "noun", "meaning": "قوس"},
+    {"pos": "verb", "meaning": "ينحني"}
   ]
-  Also set "meaning" to the first sense and "pos" to the first sense pos.
+- Set "meaning" to the first sense meaning and "pos" to the first sense pos.
 - Never write multiple Arabic meanings in one string with " / " or " | ".
+- ONLY use information present in the book text. Do not invent synonyms/antonyms not written in the book.
+- Arabic meaning: if not written in the book, provide a careful short translation; do not add extra encyclopedia facts.
 
 Rules for synonyms & antonyms:
 - ONLY take them from the book text itself.
@@ -62,33 +63,28 @@ Return ONLY a valid JSON array of objects. No markdown, no explanation.
 Example format:
 [
   {
-    "word": "abandon",
-    "meaning": "يتخلى عن",
-    "pos": "verb",
-    "senses": [
-      {"pos": "verb", "meaning": "يتخلى عن"},
-      {"pos": "verb", "meaning": "يهجر"}
-    ],
-    "definition": "to leave something permanently",
-    "example": "He decided to abandon the project.",
-    "synonyms": [{"word": "leave"}, {"word": "desert"}],
-    "antonyms": [{"word": "keep"}],
-    "importance": "key"
-  },
-  {
     "word": "bow",
-    "meaning": "ينحني",
-    "pos": "verb",
-    "definition": "to bend the head or body",
-    "synonyms": [],
+    "meaning": "قوس",
+    "pos": "noun",
+    "senses": [
+      {"pos": "noun", "meaning": "قوس"},
+      {"pos": "verb", "meaning": "ينحني"}
+    ],
+    "definition": "a curved weapon; or to bend the body in respect",
+    "example": "He bowed to the audience.",
+    "synonyms": [{"word": "bend"}],
     "antonyms": [],
     "importance": "key"
   },
   {
-    "word": "bow",
-    "meaning": "قوس",
+    "word": "bank",
+    "meaning": "بنك",
     "pos": "noun",
-    "definition": "a weapon for shooting arrows",
+    "senses": [
+      {"pos": "noun", "meaning": "بنك"},
+      {"pos": "noun", "meaning": "ضفة"}
+    ],
+    "definition": "a financial institution; or the side of a river",
     "synonyms": [],
     "antonyms": [],
     "importance": "key"

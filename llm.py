@@ -9,18 +9,18 @@ try:
 except ImportError:
     fitz = None
 
-# LLM clients
-import google.generativeai as genai
+# LLM clients — using the current (non-deprecated) Google Gen AI SDK
+from google import genai
+from google.genai import types
 from groq import Groq
 
 # ====================== Config ======================
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ====================== Prompt ======================
@@ -101,11 +101,17 @@ MAX_INPUT_CHARS = 28000  # room for ~400-word glossary tables without truncation
 
 
 def _call_gemini(text: str) -> str:
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(
-        [SYSTEM_PROMPT, f"\n\nText from the book:\n{text[:MAX_INPUT_CHARS]}"]
+    if not gemini_client:
+        raise Exception("GEMINI_API_KEY not configured")
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=f"Text from the book:\n{text[:MAX_INPUT_CHARS]}",
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.2,
+        ),
     )
-    return response.text
+    return response.text or ""
 
 
 def _call_groq(text: str) -> str:
@@ -130,7 +136,7 @@ def _clean_json(raw: str) -> List[Dict]:
         if raw.startswith("json"):
             raw = raw[4:]
     raw = raw.strip()
-    
+
     try:
         data = json.loads(raw)
         if isinstance(data, list):
@@ -145,7 +151,7 @@ def _clean_json(raw: str) -> List[Dict]:
         if start != -1 and end > start:
             try:
                 return json.loads(raw[start:end])
-            except:
+            except Exception:
                 pass
         return []
 
@@ -160,13 +166,13 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
     try:
         if provider == "groq" and groq_client:
             raw_response = _call_groq(text)
-        elif GEMINI_API_KEY:
+        elif gemini_client:
             raw_response = _call_gemini(text)
         else:
             raise Exception("No LLM provider configured")
     except Exception as e:
         # fallback
-        if provider == "groq" and GEMINI_API_KEY:
+        if provider == "groq" and gemini_client:
             raw_response = _call_gemini(text)
         elif groq_client:
             raw_response = _call_groq(text)
@@ -174,47 +180,63 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
             raise e
 
     entries = _clean_json(raw_response)
-    
+
     # basic cleaning
     cleaned = []
     for e in entries:
         if not e.get("word"):
             continue
         cleaned.append(e)
-    
+
     return cleaned
+
+
+OCR_PROMPT = (
+    "This image is a bilingual English-Arabic vocabulary table from a school textbook. "
+    "It may have MULTIPLE side-by-side column blocks per row (e.g. several word/translation "
+    "pairs across the same row, under section headers like 'Part 1', 'Part 2'). "
+    "Extract EVERY word pair you see, reading each column block fully top-to-bottom before "
+    "moving to the next block to the right. For EACH pair output exactly one line:\n"
+    "english_word = الترجمة العربية\n"
+    "Rules:\n"
+    "- One pair per line, nothing else on the line.\n"
+    "- Keep the English word/phrase exactly as written (including phrasal verbs like 'seek to').\n"
+    "- Keep the Arabic translation exactly as written, including any '/' alternatives.\n"
+    "- Do NOT merge two different rows together and do NOT skip any row.\n"
+    "- If a 'Part' or section title appears, output a line: ## Part N\n"
+    "- Output plain text only, no markdown table, no extra commentary."
+)
+
+
+def _ocr_page_with_gemini(png_bytes: bytes) -> str:
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_text(text=OCR_PROMPT),
+            types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+        ],
+        config=types.GenerateContentConfig(temperature=0.1),
+    )
+    return (response.text or "").strip()
 
 
 def _ocr_pages_with_gemini(doc, max_pages: int = 20) -> str:
     """Render PDF pages to images and extract text via Gemini Vision (scanned books)."""
-    if not GEMINI_API_KEY:
+    if not gemini_client:
         raise Exception(
             "This PDF looks scanned (image-only). OCR needs GEMINI_API_KEY to be configured."
         )
-
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    ocr_prompt = (
-        "Extract ALL readable text from this textbook page image. "
-        "Preserve vocabulary lists, definitions, synonyms, antonyms, and examples. "
-        "Output plain text only, no markdown."
-    )
 
     parts_text = []
     n = min(len(doc), max_pages)
     for i in range(n):
         page = doc[i]
-        mat = fitz.Matrix(1.5, 1.5)
+        mat = fitz.Matrix(2.0, 2.0)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         png_bytes = pix.tobytes("png")
 
         try:
-            response = model.generate_content(
-                [
-                    ocr_prompt,
-                    {"mime_type": "image/png", "data": png_bytes},
-                ]
-            )
-            page_text = (response.text or "").strip()
+            page_text = _ocr_page_with_gemini(png_bytes)
             if page_text:
                 parts_text.append(f"--- Page {i + 1} ---\n{page_text}")
         except Exception as ex:
@@ -263,28 +285,12 @@ def extract_vocabulary_from_pdf(
     used_ocr = False
 
     if text_len < 80:
-        if not GEMINI_API_KEY:
+        if not gemini_client:
             doc.close()
             raise Exception(
                 "This PDF looks scanned (image-only). OCR needs GEMINI_API_KEY."
             )
 
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        ocr_prompt = (
-            "This image is a bilingual English-Arabic vocabulary table from a school textbook. "
-            "It may have MULTIPLE side-by-side column blocks per row (e.g. several word/translation "
-            "pairs across the same row, under section headers like 'Part 1', 'Part 2'). "
-            "Extract EVERY word pair you see, reading each column block fully top-to-bottom before "
-            "moving to the next block to the right. For EACH pair output exactly one line:\n"
-            "english_word = الترجمة العربية\n"
-            "Rules:\n"
-            "- One pair per line, nothing else on the line.\n"
-            "- Keep the English word/phrase exactly as written (including phrasal verbs like 'seek to').\n"
-            "- Keep the Arabic translation exactly as written, including any '/' alternatives.\n"
-            "- Do NOT merge two different rows together and do NOT skip any row.\n"
-            "- If a 'Part' or section title appears, output a line: ## Part N\n"
-            "- Output plain text only, no markdown table, no extra commentary."
-        )
         parts = []
         ocr_count = 0
         for i in range(start_idx, end):
@@ -298,13 +304,7 @@ def extract_vocabulary_from_pdf(
             pix = page.get_pixmap(matrix=mat, alpha=False)
             png_bytes = pix.tobytes("png")
             try:
-                response = model.generate_content(
-                    [
-                        ocr_prompt,
-                        {"mime_type": "image/png", "data": png_bytes},
-                    ]
-                )
-                page_text = (response.text or "").strip()
+                page_text = _ocr_page_with_gemini(png_bytes)
                 if page_text:
                     parts.append("--- Page %d ---\n%s" % (i + 1, page_text))
             except Exception as ex:
@@ -313,6 +313,13 @@ def extract_vocabulary_from_pdf(
 
         full_text = "\n\n".join(parts)
         used_ocr = True
+
+        if parts and all("(OCR failed" in p for p in parts):
+            doc.close()
+            raise Exception(
+                "OCR failed on every page — check that GEMINI_API_KEY is valid and the "
+                "model name is not deprecated. Raw error: " + full_text
+            )
 
     doc.close()
 

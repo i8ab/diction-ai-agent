@@ -108,9 +108,10 @@ def extract_full_text_from_pdf(
                 "This PDF looks scanned (image-only). OCR needs GEMINI_API_KEY."
             )
 
-        import google.generativeai as genai
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=gemini_key)
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
         ocr_prompt = (
             "Extract ALL readable text from this textbook page image. "
@@ -125,12 +126,17 @@ def extract_full_text_from_pdf(
         ocr_count = 0
         for i in range(min(total_pages, max_ocr_pages)):
             page = doc[i]
-            mat = fitz.Matrix(1.5, 1.5)
+            mat = fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             png_bytes = pix.tobytes("png")
             try:
-                response = model.generate_content(
-                    [ocr_prompt, {"mime_type": "image/png", "data": png_bytes}]
+                response = client.models.generate_content(
+                    model=gemini_model,
+                    contents=[
+                        types.Part.from_text(text=ocr_prompt),
+                        types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+                    ],
+                    config=types.GenerateContentConfig(temperature=0.1),
                 )
                 page_text = (response.text or "").strip()
                 if page_text:
@@ -141,6 +147,13 @@ def extract_full_text_from_pdf(
 
         full_text = "\n\n".join(parts)
         used_ocr = True
+
+        if parts and all("(OCR failed" in p for p in parts):
+            doc.close()
+            raise Exception(
+                "OCR failed on every page — check that GEMINI_API_KEY is valid and the "
+                "model name is not deprecated. Raw error: " + full_text
+            )
 
     doc.close()
 
@@ -313,12 +326,14 @@ def generate_answer(prompt: str) -> str:
         return response.choices[0].message.content.strip()
 
     if gemini_key:
-        import google.generativeai as genai
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.2, "max_output_tokens": 1500},
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=gemini_key)
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        response = client.models.generate_content(
+            model=gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=1500),
         )
         return (response.text or "").strip()
 

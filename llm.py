@@ -23,7 +23,7 @@ from groq import Groq
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -337,6 +337,8 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
 
     all_entries: List[Dict[str, Any]] = []
     seen_words = set()
+    last_err = None
+    failed_batches = 0
 
     for i, batch in enumerate(batches):
         logger.info("extract_vocabulary_from_text: processing batch %d/%d (%d chars)",
@@ -344,8 +346,10 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
         try:
             batch_entries = _extract_vocabulary_single_batch(batch)
         except Exception as ex:
-            logger.exception("extract_vocabulary_from_text: batch %d/%d failed, skipping it: %s",
+            logger.exception("extract_vocabulary_from_text: batch %d/%d failed: %s",
                               i + 1, len(batches), ex)
+            last_err = ex
+            failed_batches += 1
             continue
 
         for e in batch_entries:
@@ -355,8 +359,14 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
             seen_words.add(key)
             all_entries.append(e)
 
-    logger.info("extract_vocabulary_from_text: %d total entries after merging %d batch(es)",
-                len(all_entries), len(batches))
+    logger.info("extract_vocabulary_from_text: %d total entries after merging %d batch(es) (%d failed)",
+                len(all_entries), len(batches), failed_batches)
+
+    # If every single batch failed, this isn't "no vocabulary found" — it's a real
+    # error (bad API key, model down, etc). Surface it instead of silently returning
+    # an empty list, which used to look like "0 words extracted" with no explanation.
+    if failed_batches == len(batches) and last_err is not None:
+        raise last_err
 
     return all_entries
 

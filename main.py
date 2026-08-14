@@ -16,12 +16,18 @@ from rag import (
     retrieve_relevant_chunks,
     build_chat_prompt,
     generate_answer,
+    build_tutor_prompt,
+    generate_tutor_answer,
+    sanitize_user_context,
 )
 
 app = FastAPI(
-    title="Dictionary AI Agent + Book Chat",
-    description="Extract vocabulary from textbooks + RAG chatbot that answers only from uploaded books",
-    version="1.0.0",
+    title="Dictionary AI Agent + Book Chat + Personal Tutor",
+    description=(
+        "Extract vocabulary from textbooks + RAG chatbot (books only) "
+        "+ personal study tutor (answers from live user progress summary, no storage)"
+    ),
+    version="1.1.0",
 )
 
 # ====================== CORS ======================
@@ -97,6 +103,33 @@ class ChatResponse(BaseModel):
     message: Optional[str] = None
 
 
+# ====================== Models (Personal Tutor) ======================
+class TutorHistoryItem(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class TutorChatRequest(BaseModel):
+    """
+    Personal study tutor — no server-side storage of user data.
+    Send a small live summary with every request.
+    """
+    question: str
+    # Small live snapshot from the app (numbers + short word samples only)
+    user_context: Optional[dict] = None
+    # Optional last few turns (client keeps history; server does not)
+    history: Optional[List[TutorHistoryItem]] = None
+
+
+class TutorChatResponse(BaseModel):
+    success: bool
+    answer: str
+    # Detected action hint if the model suggested opening a tool (quiz / flashcards)
+    action: Optional[str] = None
+    context_used: Optional[dict] = None
+    message: Optional[str] = None
+
+
 # ====================== Helpers ======================
 def generate_id() -> str:
     return uuid.uuid4().hex[:16]
@@ -156,14 +189,20 @@ def adapt_entry(
 @app.get("/")
 def root():
     return {
-        "service": "Dictionary AI Agent + Book Chat",
+        "service": "Dictionary AI Agent + Book Chat + Personal Tutor",
         "status": "running",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "llm_provider": os.getenv("LLM_PROVIDER", "gemini"),
         "features": [
             "vocabulary extraction from text/PDF",
             "upload full book + RAG chat (answers only from the book)",
+            "personal study tutor (live user progress, no storage on server)",
         ],
+        "endpoints": {
+            "tutor": "POST /tutor-chat",
+            "book_chat": "POST /chat",
+            "extract_pdf": "POST /extract-pdf",
+        },
     }
 
 
@@ -175,6 +214,7 @@ def health():
         "groq_configured": bool(os.getenv("GROQ_API_KEY")),
         "active_provider": os.getenv("LLM_PROVIDER", "gemini"),
         "books_count": len(list_books()),
+        "tutor_enabled": True,
     }
 
 
@@ -380,6 +420,74 @@ async def chat(req: ChatRequest):
         "book_title": book.get("title"),
         "sources_used": len(contexts),
         "message": "Answer generated from book content only",
+    }
+
+
+# ====================== Personal Tutor (live context, no storage) ======================
+def _extract_action_from_answer(answer: str) -> Optional[str]:
+    """
+    Parse optional machine hint from the model:
+      → ACTION: quiz_weak
+      → ACTION: flashcards_all
+    etc. Returns the action token or None.
+    """
+    if not answer:
+        return None
+    import re
+    m = re.search(r"(?:→\s*)?ACTION:\s*([a-z0-9_]+)", answer, re.IGNORECASE)
+    if not m:
+        return None
+    action = m.group(1).lower().strip()
+    allowed = {
+        "quiz_weak",
+        "quiz_all",
+        "flashcards_weak",
+        "flashcards_all",
+        "flashcards_recent",
+    }
+    return action if action in allowed else None
+
+
+@app.post("/tutor-chat", dependencies=[Depends(verify_secret)])
+async def tutor_chat(req: TutorChatRequest):
+    """
+    Personal study tutor.
+
+    - Does NOT store any user data on the server.
+    - Expects a small live summary in `user_context` with each request.
+    - Answers questions about progress, weak words, study advice.
+    - Can suggest opening quiz / flashcards via an `action` field.
+    """
+    question = (req.question or "").strip()
+    if not question or len(question) < 1:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    # Sanitize + cap size (bandwidth protection)
+    safe_ctx = sanitize_user_context(req.user_context)
+
+    history_dicts = None
+    if req.history:
+        history_dicts = [
+            {"role": h.role, "content": h.content}
+            for h in req.history
+            if h and (h.content or "").strip()
+        ]
+
+    prompt = build_tutor_prompt(question, safe_ctx, history=history_dicts)
+
+    try:
+        answer = generate_tutor_answer(prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
+
+    action = _extract_action_from_answer(answer)
+
+    return {
+        "success": True,
+        "answer": answer,
+        "action": action,
+        "context_used": safe_ctx,  # echo what was actually used (for debugging / UI)
+        "message": "Answer generated from live user summary only (nothing stored on server)",
     }
 
 

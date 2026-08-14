@@ -352,11 +352,14 @@ def build_chat_prompt(query: str, contexts: List[str], language_hint: str = "aut
 الإجابة:"""
 
 
-def generate_answer(prompt: str) -> str:
+def generate_answer(prompt: str, system_message: str = None) -> str:
     """Call the configured LLM (Groq preferred for speed/cost)."""
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
     groq_key = os.getenv("GROQ_API_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
+    sys_msg = system_message or (
+        "You are a helpful educational assistant. Answer only from the provided book context."
+    )
 
     if provider == "groq" and groq_key:
         from groq import Groq
@@ -364,10 +367,10 @@ def generate_answer(prompt: str) -> str:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a helpful educational assistant. Answer only from the provided book context."},
+                {"role": "system", "content": sys_msg},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
+            temperature=0.3,
             max_tokens=1500,
         )
         return response.choices[0].message.content.strip()
@@ -377,12 +380,14 @@ def generate_answer(prompt: str) -> str:
         from google.genai import types
         client = genai.Client(api_key=gemini_key)
         gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        # For Gemini we prepend system guidance into the prompt when a custom one is given
+        full_prompt = prompt if not system_message else f"{system_message}\n\n{prompt}"
         response = _gemini_generate_with_retry(
             client,
             model=gemini_model,
-            contents=prompt,
+            contents=full_prompt,
             config=types.GenerateContentConfig(
-                temperature=0.2,
+                temperature=0.3,
                 max_output_tokens=3000,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
@@ -390,3 +395,162 @@ def generate_answer(prompt: str) -> str:
         return _extract_text(response)
 
     raise Exception("No LLM provider configured. Set GROQ_API_KEY or GEMINI_API_KEY.")
+
+
+# ====================== Personal Tutor (user progress, no storage) ======================
+
+# Hard caps so the payload stays small (bandwidth-friendly)
+MAX_WEAK_WORDS = 20
+MAX_RECENT_WORDS = 10
+MAX_HISTORY_TURNS = 6
+
+
+def _cap_list(items, limit: int) -> list:
+    if not items:
+        return []
+    if not isinstance(items, list):
+        return []
+    return [str(x).strip() for x in items if str(x).strip()][:limit]
+
+
+def sanitize_user_context(raw: dict | None) -> dict:
+    """
+    Keep only a small, useful summary of the user.
+    Nothing is stored — this is used for the current request only.
+    """
+    if not raw or not isinstance(raw, dict):
+        return {}
+
+    weak = _cap_list(raw.get("weak_words") or raw.get("weakWords") or [], MAX_WEAK_WORDS)
+    recent = _cap_list(
+        raw.get("recent_words") or raw.get("recent_studied") or raw.get("recentWords") or [],
+        MAX_RECENT_WORDS,
+    )
+
+    def _num(key_variants, default=0):
+        for k in key_variants:
+            if k in raw and raw[k] is not None:
+                try:
+                    return int(raw[k])
+                except (TypeError, ValueError):
+                    try:
+                        return int(float(raw[k]))
+                    except (TypeError, ValueError):
+                        pass
+        return default
+
+    ctx = {
+        "name": str(raw.get("name") or raw.get("user_name") or "").strip() or None,
+        "total_words": _num(["total_words", "totalWords", "total"]),
+        "mastered": _num(["mastered", "mastered_count", "masteredCount"]),
+        "learning": _num(["learning", "learning_count", "learningCount"]),
+        "weak_count": _num(["weak", "weak_count", "weakCount"], len(weak)),
+        "today_studied": _num(["today_studied", "todayStudied", "today_count"]),
+        "streak": _num(["streak", "current_streak"]),
+        "level": _num(["level", "xp_level", "xpLevel"]),
+        "weak_words": weak,
+        "recent_words": recent,
+        "last_activity": str(raw.get("last_activity") or raw.get("lastActivity") or "").strip() or None,
+    }
+    # Drop empty / zero-noise fields to keep the prompt lean
+    return {k: v for k, v in ctx.items() if v not in (None, "", [], 0)}
+
+
+def build_tutor_prompt(
+    question: str,
+    user_context: dict,
+    history: list | None = None,
+) -> str:
+    """
+    Build a prompt for the personal study tutor.
+    Uses only the small summary sent with this request (no server-side storage).
+    """
+    ctx = sanitize_user_context(user_context)
+
+    # Compact human-readable block
+    lines = []
+    if ctx.get("name"):
+        lines.append(f"- الاسم: {ctx['name']}")
+    if "total_words" in ctx:
+        lines.append(f"- إجمالي الكلمات: {ctx['total_words']}")
+    if "mastered" in ctx:
+        lines.append(f"- متقنة (mastered): {ctx['mastered']}")
+    if "learning" in ctx:
+        lines.append(f"- قيد التعلم: {ctx['learning']}")
+    if "weak_count" in ctx:
+        lines.append(f"- عدد الكلمات الضعيفة: {ctx['weak_count']}")
+    if "today_studied" in ctx:
+        lines.append(f"- ذاكر اليوم: {ctx['today_studied']} كلمة")
+    if "streak" in ctx:
+        lines.append(f"- سلسلة الأيام (streak): {ctx['streak']}")
+    if "level" in ctx:
+        lines.append(f"- المستوى: {ctx['level']}")
+    if ctx.get("last_activity"):
+        lines.append(f"- آخر نشاط: {ctx['last_activity']}")
+    if ctx.get("weak_words"):
+        lines.append("- عينة من الكلمات الضعيفة: " + ", ".join(ctx["weak_words"]))
+    if ctx.get("recent_words"):
+        lines.append("- كلمات حديثة: " + ", ".join(ctx["recent_words"]))
+
+    context_block = "\n".join(lines) if lines else "(لا توجد بيانات تقدم مرسلة مع هذا الطلب)"
+
+    # Optional short history (client-side only)
+    history_block = ""
+    if history and isinstance(history, list):
+        turns = []
+        for h in history[-MAX_HISTORY_TURNS:]:
+            if not isinstance(h, dict):
+                continue
+            role = str(h.get("role") or "").lower()
+            content = str(h.get("content") or h.get("text") or "").strip()
+            if not content:
+                continue
+            label = "الطالب" if role in ("user", "student", "human") else "المساعد"
+            turns.append(f"{label}: {content[:400]}")
+        if turns:
+            history_block = "\n\nمحادثة سابقة (مختصرة):\n" + "\n".join(turns)
+
+    system_rules = """أنت مساعد دراسة شخصي ذكي لتطبيق قاموس/مفردات (Two Tongues / Bacaloria).
+
+قواعد مهمة جدًا:
+1) استخدم فقط معلومات تقدم المستخدم الموجودة في "ملخص حالة المستخدم" أدناه. لا تخترع أرقام أو كلمات غير موجودة هناك.
+2) لو المعلومة مش موجودة في الملخص، قول بصراحة إنك مش عارف أو إن البيانات دي مش متاحة دلوقتي (مثلاً: "مش عندي المعلومة دي في البيانات الحالية").
+3) جاوب بنفس لغة سؤال المستخدم (عربي أو إنجليزي).
+4) كن مختصرًا وواضحًا ومشجعًا، ومناسب لطالب بيذاكر مفردات.
+5) لو سأل عن الكلمات الضعيفة أو اللي محتاج يركز عليها: اعتمد على قائمة "الكلمات الضعيفة" في الملخص. لو القائمة فاضية، قول كده بصراحة.
+6) لو طلب كويز أو فلاش كارد أو مراجعة:
+   - انصحه بطريقة طبيعية.
+   - في آخر الرد أضف سطر واحد بالشكل ده بالظبط عشان التطبيق يقدر يفتح الشاشة المناسبة:
+     → ACTION: quiz_weak
+     أو → ACTION: quiz_all
+     أو → ACTION: flashcards_weak
+     أو → ACTION: flashcards_all
+     أو → ACTION: flashcards_recent
+   استخدم الأكشن الأنسب فقط، ومش لازم تحط أكشن لو السؤال مش طلب فتح أداة.
+7) ممنوع تخزن أو تفتكر بيانات من محادثات سابقة غير اللي مبعوتة في "محادثة سابقة". كل طلب مستقل.
+8) لو السؤال عام عن المفردات أو ترجمة ومش متعلق بتقدم المستخدم، جاوب باختصار مفيد أو قول إن تخصصك هنا متابعة تقدمه الدراسي."""
+
+    return f"""{system_rules}
+
+ملخص حالة المستخدم (لحظي، من هذا الطلب فقط):
+{context_block}
+{history_block}
+
+---
+سؤال المستخدم: {question}
+
+الإجابة:"""
+
+
+TUTOR_SYSTEM_MESSAGE = (
+    "You are a personal vocabulary study coach. "
+    "Answer only from the user progress summary provided in the prompt. "
+    "If data is missing, say you don't know. "
+    "Match the user's language (Arabic or English). "
+    "When suggesting quiz/flashcards, end with a single line like: → ACTION: quiz_weak"
+)
+
+
+def generate_tutor_answer(prompt: str) -> str:
+    """Generate answer for the personal tutor (slightly warmer temperature)."""
+    return generate_answer(prompt, system_message=TUTOR_SYSTEM_MESSAGE)

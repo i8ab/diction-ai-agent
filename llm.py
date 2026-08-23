@@ -90,7 +90,14 @@ Your job:
 2. For each word extract:
    - word (the English word)
    - meaning (ONE primary Arabic meaning - clear and short)
-   - pos (part of speech: noun, verb, adjective, adverb...)
+   - pos (part of speech — be extremely precise):
+     Allowed values ONLY: noun, verb, adjective, adverb, preposition, conjunction,
+     pronoun, interjection, phrase, other, unclassified.
+     • Use the standard grammatical category when it is clear from context.
+     • If the word is a multi-word expression or fixed collocation → "phrase".
+     • If the word is foreign, a neologism, proper-name-like, ambiguous, or has no
+       clear part of speech in the source → use "other" or "unclassified".
+       NEVER force a false category. Prefer "unclassified" over guessing.
    - definition: include this field ONLY if the book text you were given literally contains an
      English definition/explanation for that word. Copy or lightly rephrase it from the book.
      If the source is just a simple "english = meaning" pair with no definition written anywhere
@@ -116,6 +123,8 @@ IMPORTANT - One entry per English word spelling:
 - Never write multiple Arabic meanings in one string with " / " or " | ".
 - ONLY use information present in the book text. Do not invent synonyms/antonyms not written in the book.
 - Arabic meaning: if not written in the book, provide a careful short translation; do not add extra encyclopedia facts.
+- Continuously infer context: adapt analysis to the surrounding unit, section headings,
+  and glossary style. Prefer high-precision extraction over volume.
 
 Rules for synonyms & antonyms:
 - ONLY take them from the book text itself.
@@ -142,6 +151,12 @@ Example format — "bow" has no definition in the source (omit the field), "bank
     "pos": "noun",
     "definition": "a financial institution that accepts deposits and lends money",
     "importance": "key"
+  },
+  {
+    "word": "COVID-19",
+    "meaning": "كوفيد-19",
+    "pos": "unclassified",
+    "importance": "additional"
   }
 ]
 """

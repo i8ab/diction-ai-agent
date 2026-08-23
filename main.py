@@ -22,12 +22,13 @@ from rag import (
 )
 
 app = FastAPI(
-    title="Dictionary AI Agent + Book Chat + Personal Tutor",
+    title="AI Agent UHD — Dictionary AI Agent + Book Chat + Personal Tutor",
     description=(
-        "Extract vocabulary from textbooks + RAG chatbot (books only) "
-        "+ personal study tutor (answers from live user progress summary, no storage)"
+        "State-of-the-art vocabulary extraction (any textbook PDF) with precise POS tagging "
+        "(including other/unclassified), RAG book chatbot, and personal study tutor. "
+        "All responses prefer Arabic when the user writes in Arabic."
     ),
-    version="1.1.0",
+    version="2.0.0-UHD",
 )
 
 # ====================== CORS ======================

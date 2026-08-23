@@ -1,4 +1,4 @@
-# Dictionary AI Agent + Book Chatbot + Personal Tutor
+# AI Agent UHD — Dictionary AI Agent + Book Chat + Personal Tutor
 
 سيرفر واحد بيعمل ثلاث حاجات:
 

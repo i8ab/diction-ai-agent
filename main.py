@@ -143,30 +143,78 @@ def adapt_entry(
     section: str = "en-ar",
     added_by: str = "ai-agent",
 ) -> dict:
-    """Convert AI Agent raw output to the format used in the dictionary frontend."""
+    """Convert AI Agent raw output to the format used in the dictionary frontend.
+
+    Multi-sense words keep a rich `senses` array so the frontend can show
+    POS tabs (Noun / Verb / …) and load definition / example / synonyms /
+    antonyms for the selected sense only.
+    """
 
     def normalize_list(items):
         if not items:
             return []
         result = []
         for item in items:
-            if isinstance(item, dict):
-                result.append(item)
+            if isinstance(item, dict) and item.get("word"):
+                result.append({"word": str(item["word"]).strip()})
             elif isinstance(item, str) and item.strip():
                 result.append({"word": item.strip()})
         return result
 
-    senses = raw.get("senses") or []
-    primary_meaning = raw.get("meaning") or ""
-    if senses and not primary_meaning:
-        primary_meaning = senses[0].get("meaning", "")
+    def normalize_sense(s, idx):
+        # type: (Any, int) -> Optional[dict]
+        if not isinstance(s, dict):
+            return None
+        meaning = str(s.get("meaning") or "").strip()
+        if not meaning:
+            return None
+        sense = {
+            "id": s.get("id") or f"s{idx}",
+            "pos": s.get("pos") or "",
+            "meaning": meaning,
+        }
+        definition = str(s.get("definition") or "").strip()
+        if definition:
+            sense["definition"] = definition
+        example = s.get("example")
+        examples = s.get("examples")
+        if isinstance(examples, list) and examples:
+            cleaned = [str(e).strip() for e in examples if e]
+            if cleaned:
+                sense["examples"] = cleaned
+                sense["example"] = cleaned[0]
+        elif example:
+            sense["example"] = str(example).strip()
+            sense["examples"] = [sense["example"]]
+        syns = normalize_list(s.get("synonyms"))
+        if syns:
+            sense["synonyms"] = syns
+        ants = normalize_list(s.get("antonyms"))
+        if ants:
+            sense["antonyms"] = ants
+        return sense
+
+    raw_senses = raw.get("senses") or []
+    senses = []
+    for i, s in enumerate(raw_senses):
+        normalized = normalize_sense(s, i)
+        if normalized:
+            senses.append(normalized)
+
+    primary_meaning = str(raw.get("meaning") or "").strip()
+    primary_pos = raw.get("pos")
+    if senses:
+        if not primary_meaning:
+            primary_meaning = senses[0]["meaning"]
+        if not primary_pos:
+            primary_pos = senses[0].get("pos")
 
     now = int(time.time() * 1000)
     out = {
         "id": generate_id(),
         "word": (raw.get("word") or "").strip(),
         "meaning": primary_meaning,
-        "pos": raw.get("pos"),
+        "pos": primary_pos,
         "definition": raw.get("definition"),
         "example": raw.get("example") or (raw.get("examples") or [None])[0],
         "examples": raw.get("examples") or [],
@@ -181,8 +229,25 @@ def adapt_entry(
         "from_ai": True,
         "importance": raw.get("importance", "key"),
     }
+
+    # Only attach senses when there is more than one distinct meaning/POS.
+    # Single-sense words stay flat (legacy-compatible) using top-level fields.
     if len(senses) > 1:
         out["senses"] = senses
+        # Mirror first sense onto top-level for list/card previews
+        first = senses[0]
+        out["meaning"] = first["meaning"]
+        out["pos"] = first.get("pos") or out.get("pos")
+        if first.get("definition") and not out.get("definition"):
+            out["definition"] = first["definition"]
+        if first.get("example") and not out.get("example"):
+            out["example"] = first["example"]
+            out["examples"] = first.get("examples") or [first["example"]]
+        if first.get("synonyms") and not out.get("synonyms"):
+            out["synonyms"] = first["synonyms"]
+        if first.get("antonyms") and not out.get("antonyms"):
+            out["antonyms"] = first["antonyms"]
+
     return out
 
 

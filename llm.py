@@ -114,12 +114,24 @@ IMPORTANT — keep the JSON compact:
 
 IMPORTANT - One entry per English word spelling:
 - Always create ONE object per English word (e.g. one object for "bow", one for "bank").
-- If the word has multiple meanings or multiple parts of speech, put them ALL in "senses":
+- If the word has multiple meanings or multiple parts of speech, put them ALL in "senses".
+  Each sense object MAY include its own definition / example / synonyms / antonyms
+  when the book provides them for that specific sense:
   "senses": [
-    {"pos": "noun", "meaning": "قوس"},
-    {"pos": "verb", "meaning": "ينحني"}
+    {
+      "pos": "noun",
+      "meaning": "قوس",
+      "definition": "a weapon for shooting arrows",
+      "example": "He drew his bow.",
+      "synonyms": [{"word": "arch"}]
+    },
+    {
+      "pos": "verb",
+      "meaning": "ينحني",
+      "example": "The actors bow to the audience."
+    }
   ]
-- Set "meaning" to the first sense meaning and "pos" to the first sense pos.
+- Set top-level "meaning" to the first sense meaning and top-level "pos" to the first sense pos.
 - Never write multiple Arabic meanings in one string with " / " or " | ".
 - ONLY use information present in the book text. Do not invent synonyms/antonyms not written in the book.
 - Arabic meaning: if not written in the book, provide a careful short translation; do not add extra encyclopedia facts.
@@ -128,20 +140,30 @@ IMPORTANT - One entry per English word spelling:
 
 Rules for synonyms & antonyms:
 - ONLY take them from the book text itself.
-- If the book does not mention any synonym/antonym for the word → return empty list.
+- If the book does not mention any synonym/antonym for the word → omit the field (do not return empty list).
 - Do NOT invent synonyms or antonyms.
 - Return synonyms/antonyms as objects: [{"word": "leave"}, {"word": "desert"}]
+- Prefer attaching synonyms/antonyms/example/definition to the matching sense when the word has senses.
 
 Return ONLY a valid JSON array of objects. No markdown, no explanation.
-Example format — "bow" has no definition in the source (omit the field), "bank" does (include it):
+Example format — "bow" has two senses (include per-sense fields when available), "bank" is single-sense:
 [
   {
     "word": "bow",
     "meaning": "قوس",
     "pos": "noun",
     "senses": [
-      {"pos": "noun", "meaning": "قوس"},
-      {"pos": "verb", "meaning": "ينحني"}
+      {
+        "pos": "noun",
+        "meaning": "قوس",
+        "definition": "a weapon for shooting arrows",
+        "example": "He drew his bow."
+      },
+      {
+        "pos": "verb",
+        "meaning": "ينحني",
+        "example": "The actors bow to the audience."
+      }
     ],
     "importance": "key"
   },

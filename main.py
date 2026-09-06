@@ -142,6 +142,8 @@ def adapt_entry(
     unit: str = None,
     section: str = "en-ar",
     added_by: str = "ai-agent",
+    unit_section: str = None,
+    lesson: str = None,
 ) -> dict:
     """Convert AI Agent raw output to the format used in the dictionary frontend.
 
@@ -209,6 +211,17 @@ def adapt_entry(
         if not primary_pos:
             primary_pos = senses[0].get("pos")
 
+    # Resolve the Unit-Section / Lesson placement for this word:
+    # a manual choice from the admin (unit_section / lesson params, used when
+    # auto-detect is off, or as a fallback for words the AI couldn't place)
+    # always wins over what was auto-detected from the book's own headings.
+    resolved_unit_section = (
+        unit_section if unit_section not in (None, "") else raw.get("detected_section")
+    )
+    resolved_lesson = (
+        lesson if lesson not in (None, "") else raw.get("detected_lesson")
+    )
+
     now = int(time.time() * 1000)
     out = {
         "id": generate_id(),
@@ -224,7 +237,12 @@ def adapt_entry(
         "addedAt": now,
         "addedBy": added_by or "ai-agent",
         "source_book": source_book or raw.get("source_book"),
-        "unit": unit or raw.get("unit"),
+        "unit": unit or raw.get("unit") or raw.get("detected_unit"),
+        "unitSection": resolved_unit_section,
+        "lesson": resolved_lesson,
+        "detectedUnit": raw.get("detected_unit"),
+        "detectedSection": raw.get("detected_section"),
+        "detectedLesson": raw.get("detected_lesson"),
         "page": raw.get("page"),
         "from_ai": True,
         "importance": raw.get("importance", "key"),
@@ -324,6 +342,15 @@ async def extract_from_pdf(
     added_by: Optional[str] = "ai-agent",
     page_from: Optional[int] = 1,
     page_to: Optional[int] = None,
+    # Unit → Section → Lesson placement.
+    # auto_detect_structure=True (default): the book's own "Unit/Section/Lesson"
+    #   headings (English or Arabic) decide where each word belongs; unit_section /
+    #   lesson below are only used as a fallback for words with no heading above them.
+    # auto_detect_structure=False: every extracted word is placed directly into the
+    #   single unit_section / lesson the admin chose, ignoring any headings found.
+    auto_detect_structure: Optional[bool] = True,
+    unit_section: Optional[str] = None,
+    lesson: Optional[str] = None,
     x_api_secret: Optional[str] = Header(None),
 ):
     if x_api_secret != API_SECRET:
@@ -334,13 +361,24 @@ async def extract_from_pdf(
 
     try:
         content = await file.read()
-        raw_entries = extract_vocabulary_from_pdf(
+        pdf_result = extract_vocabulary_from_pdf(
             content,
             filename=file.filename,
             page_from=page_from or 1,
             page_to=page_to,
             max_ocr_pages=50,
         )
+        raw_entries = pdf_result["entries"]
+        structure_detected = pdf_result["structure_detected"]
+
+        # auto_detect_structure=True  → placement comes purely from headings found in
+        #   the book (adapt_entry falls back to detected_section/detected_lesson);
+        #   words under no heading stay unplaced (general/unit-level), as expected.
+        # auto_detect_structure=False → every word is forced into the admin's chosen
+        #   unit_section/lesson, ignoring any headings.
+        manual_section = unit_section if not auto_detect_structure else None
+        manual_lesson = lesson if not auto_detect_structure else None
+
         book_name = source_book or file.filename.replace(".pdf", "")
         adapted = [
             adapt_entry(
@@ -349,6 +387,8 @@ async def extract_from_pdf(
                 unit=unit,
                 section=section,
                 added_by=added_by,
+                unit_section=manual_section,
+                lesson=manual_lesson,
             )
             for e in raw_entries
         ]
@@ -361,6 +401,7 @@ async def extract_from_pdf(
             "provider_used": os.getenv("LLM_PROVIDER", "gemini"),
             "page_from": page_from or 1,
             "page_to": page_to,
+            "structure_detected": structure_detected,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

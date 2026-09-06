@@ -185,6 +185,95 @@ Example format — "bow" has two senses (include per-sense fields when available
 
 MAX_INPUT_CHARS = 28000  # room for ~400-word glossary tables without truncation
 
+# ====================== Structure detection (Unit / Section / Lesson) ======================
+# Many Egyptian textbooks / revision books lay vocabulary out under headings like
+# "Unit 3", "Section A", "Lesson 2" (English) or "الوحدة 3", "القسم أ", "الدرس 2" (Arabic).
+# We scan the raw text for these headings BEFORE batching so every extracted word can be
+# tagged with the unit/section/lesson it was found under. This lets the frontend either
+# auto-place words into the matching Unit → Section → Lesson, or show the admin exactly
+# where each word came from so they can confirm/override.
+import re as _re
+
+_AR_LETTER_TO_EN = {
+    "أ": "A", "ا": "A", "ب": "B", "ت": "C", "ث": "D", "ج": "E", "ح": "F",
+    "خ": "G", "د": "H", "ذ": "I", "ر": "J",
+}
+
+_UNIT_RE = _re.compile(
+    r"(?:^|\n)\s*(?:unit|الوحدة|وحدة)\s*[:\-–]?\s*(\d+)",
+    _re.IGNORECASE,
+)
+_SECTION_RE = _re.compile(
+    r"(?:^|\n)\s*(?:section|القسم|قسم)\s*[:\-–]?\s*([A-Za-z]|[أ-ي])\b",
+    _re.IGNORECASE,
+)
+_LESSON_RE = _re.compile(
+    r"(?:^|\n)\s*(?:lesson|الدرس|درس)\s*[:\-–]?\s*(\d+)",
+    _re.IGNORECASE,
+)
+
+
+def _normalize_section_label(raw: str) -> str:
+    """Map a detected section marker to a stable letter id ('A', 'B', ...)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw in _AR_LETTER_TO_EN:
+        return _AR_LETTER_TO_EN[raw]
+    return raw.upper()
+
+
+def detect_structure_segments(text: str) -> List[Dict[str, Any]]:
+    """
+    Split `text` into segments, each tagged with the last-seen unit/section/lesson
+    heading before it. A segment always has non-empty 'text'. If no heading is ever
+    found, a single segment with unit=section=lesson=None is returned (structure not
+    detected — caller should treat the whole file as one flat lesson-less list).
+    """
+    # Collect every heading match (any kind) with its position, in document order.
+    markers = []
+    for m in _UNIT_RE.finditer(text):
+        markers.append((m.start(), "unit", m.group(1).strip()))
+    for m in _SECTION_RE.finditer(text):
+        markers.append((m.start(), "section", _normalize_section_label(m.group(1))))
+    for m in _LESSON_RE.finditer(text):
+        markers.append((m.start(), "lesson", m.group(1).strip()))
+    markers.sort(key=lambda x: x[0])
+
+    if not markers:
+        return [{"unit": None, "section": None, "lesson": None, "text": text}]
+
+    segments = []
+    cur_unit, cur_section, cur_lesson = None, None, None
+    cursor = 0
+    boundaries = [pos for pos, _, _ in markers] + [len(text)]
+
+    # Text before the first heading (if any) is "unstructured" — still worth keeping.
+    if markers[0][0] > 0:
+        pre = text[0:markers[0][0]].strip()
+        if pre:
+            segments.append({"unit": None, "section": None, "lesson": None, "text": pre})
+
+    for i, (pos, kind, value) in enumerate(markers):
+        if kind == "unit":
+            cur_unit, cur_section, cur_lesson = value, None, None
+        elif kind == "section":
+            cur_section, cur_lesson = value, None
+        elif kind == "lesson":
+            cur_lesson = value
+        chunk_end = boundaries[i + 1]
+        chunk = text[pos:chunk_end]
+        if chunk.strip():
+            segments.append({
+                "unit": cur_unit, "section": cur_section, "lesson": cur_lesson,
+                "text": chunk,
+            })
+
+    # Merge tiny/empty segments away and keep only ones with real body text.
+    return [s for s in segments if len(s["text"].strip()) >= 10] or [
+        {"unit": None, "section": None, "lesson": None, "text": text}
+    ]
+
 
 def _call_gemini(text: str) -> str:
     if not gemini_client:
@@ -406,6 +495,71 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
     return all_entries
 
 
+def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
+    """
+    Structure-aware extraction: detects Unit/Section/Lesson headings first, runs
+    extraction per-segment (so batches never straddle two lessons), and tags every
+    entry with 'detected_unit' / 'detected_section' / 'detected_lesson' (all None
+    when the source file has no such headings — that's a normal, expected case).
+
+    Returns {"entries": [...], "structure_detected": bool}.
+    """
+    if not text or len(text.strip()) < 30:
+        logger.warning("extract_vocabulary_from_text_with_structure: input too short")
+        return {"entries": [], "structure_detected": False}
+
+    segments = detect_structure_segments(text)
+    structure_detected = any(
+        s["unit"] or s["section"] or s["lesson"] for s in segments
+    )
+    logger.info(
+        "extract_vocabulary_from_text_with_structure: %d segment(s), structure_detected=%s",
+        len(segments), structure_detected,
+    )
+
+    all_entries: List[Dict[str, Any]] = []
+    seen_words = set()
+    last_err = None
+    failed_batches = 0
+    total_batches = 0
+
+    for seg_idx, seg in enumerate(segments):
+        batches = _split_into_batches(seg["text"])
+        total_batches += len(batches)
+        for i, batch in enumerate(batches):
+            logger.info(
+                "extract_vocabulary_from_text_with_structure: segment %d/%d batch %d/%d "
+                "(unit=%s section=%s lesson=%s, %d chars)",
+                seg_idx + 1, len(segments), i + 1, len(batches),
+                seg["unit"], seg["section"], seg["lesson"], len(batch),
+            )
+            try:
+                batch_entries = _extract_vocabulary_single_batch(batch)
+            except Exception as ex:
+                logger.exception(
+                    "extract_vocabulary_from_text_with_structure: segment %d batch %d failed: %s",
+                    seg_idx + 1, i + 1, ex,
+                )
+                last_err = ex
+                failed_batches += 1
+                continue
+
+            for e in batch_entries:
+                key = e.get("word", "").strip().lower()
+                if not key or key in seen_words:
+                    continue
+                seen_words.add(key)
+                e["detected_unit"] = seg["unit"]
+                e["detected_section"] = seg["section"]
+                e["detected_lesson"] = seg["lesson"]
+                all_entries.append(e)
+
+    if total_batches and failed_batches == total_batches and last_err is not None:
+        raise last_err
+
+    return {"entries": all_entries, "structure_detected": structure_detected}
+
+
 OCR_PROMPT = (
     "This image is a bilingual English-Arabic vocabulary table from a school textbook. "
     "It may have MULTIPLE side-by-side column blocks per row (e.g. several word/translation "
@@ -550,7 +704,8 @@ def extract_vocabulary_from_pdf(
             "Try a clearer scan, a smaller page range, or a text-based PDF."
         )
 
-    entries = extract_vocabulary_from_text(full_text)
+    result = extract_vocabulary_from_text_with_structure(full_text)
+    entries = result["entries"]
 
     book_name = filename.replace(".pdf", "").replace(".PDF", "")
     for e in entries:
@@ -560,4 +715,4 @@ def extract_vocabulary_from_pdf(
         if used_ocr:
             e["ocr"] = True
 
-    return entries
+    return {"entries": entries, "structure_detected": result["structure_detected"]}

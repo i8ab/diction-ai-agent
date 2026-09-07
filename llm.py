@@ -87,6 +87,32 @@ Your job:
    - It is fine, and expected, for "definition", "example", "synonyms", and "antonyms" to be empty
      when the source is just a word=meaning list — never skip a word just because those fields are missing.
 
+   Egyptian revision books (like "المعاصر") very commonly split one word's information across
+   SEVERAL separate tables instead of putting it all next to the word. You MUST merge these back
+   together into ONE entry per word:
+     • A "Vocabulary" table (word ↔ Arabic meaning), then later
+     • A separate "Definitions" table (word ↔ English definition), then
+     • A separate "Synonyms" table (word ↔ synonym list), then
+     • A separate "Antonyms" table (word ↔ antonym list), then
+     • A "Vocabulary Study" section with "Verbal Collocations" (verb + word, e.g. "create
+       unrealistic expectations"), "Expressions & Idioms", "Verb + Preposition" pairs, and a
+       "Word Family" box (related forms of the same root with one example sentence each, and a
+       "✗ Don't mix" note contrasting two easily-confused words).
+   When you see the SAME English word appear again in a later table/box in the same input, treat
+   it as more data for the SAME entry, not a new/duplicate word:
+     - meaning: keep the first Arabic meaning already found (or set it if this is the first time).
+     - definition: fill from the Definitions table if present.
+     - synonyms / antonyms: fill from the Synonyms / Antonyms tables if present.
+     - example: if no example sentence was given elsewhere, you may use ONE short example
+       sentence from that word's "Word Family" box if the book gives one (e.g. "'Always' is an
+       absolute word."), or a collocation from "Verbal Collocations" (e.g. "create unrealistic
+       expectations") turned into a natural sentence fragment. Never invent a sentence that isn't
+       built from words actually printed in the book.
+   Do not create a separate low-value entry just because a word also appears inside a collocation,
+   idiom, or "Don't mix" note — that supporting text enriches the existing entry for that word,
+   it does not create a new one (unless the collocation/idiom itself is the vocabulary item being
+   taught, e.g. "play a major role" as its own phrase entry).
+
 2. For each word extract:
    - word (the English word)
    - meaning (ONE primary Arabic meaning - clear and short)
@@ -447,6 +473,23 @@ def _split_into_batches(text: str, batch_char_limit: int = BATCH_CHAR_LIMIT) -> 
     return [b for b in batches if b.strip()]
 
 
+def _merge_entry(existing: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+    """Fill missing fields on `existing` (in place) from a later occurrence of the
+    same word found in a different batch. This is what lets a word whose meaning
+    was found in a "Vocabulary" table get its definition/synonyms/antonyms filled
+    in later from separate "Definitions"/"Synonyms"/"Antonyms" tables that landed
+    in a different batch (common in Egyptian revision books). We never overwrite
+    a field that already has content — only fill in what's missing."""
+    for field in ("meaning", "pos", "definition", "example", "importance"):
+        if not existing.get(field) and incoming.get(field):
+            existing[field] = incoming[field]
+    for field in ("synonyms", "antonyms"):
+        if not existing.get(field) and incoming.get(field):
+            existing[field] = incoming[field]
+    if not existing.get("senses") and incoming.get("senses"):
+        existing["senses"] = incoming["senses"]
+
+
 def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
     if not text or len(text.strip()) < 30:
         logger.warning("extract_vocabulary_from_text: input text too short (%d chars)", len(text or ""))
@@ -460,7 +503,7 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
                 len(batches), BATCH_CHAR_LIMIT)
 
     all_entries: List[Dict[str, Any]] = []
-    seen_words = set()
+    by_word: Dict[str, Dict[str, Any]] = {}
     last_err = None
     failed_batches = 0
 
@@ -478,10 +521,16 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
 
         for e in batch_entries:
             key = e.get("word", "").strip().lower()
-            if not key or key in seen_words:
+            if not key:
                 continue
-            seen_words.add(key)
-            all_entries.append(e)
+            if key in by_word:
+                # Same word seen again in a later batch — merge in whatever new
+                # info it brings (definition/synonyms/antonyms/example) instead
+                # of silently discarding it.
+                _merge_entry(by_word[key], e)
+            else:
+                by_word[key] = e
+                all_entries.append(e)
 
     logger.info("extract_vocabulary_from_text: %d total entries after merging %d batch(es) (%d failed)",
                 len(all_entries), len(batches), failed_batches)
@@ -518,7 +567,7 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
     )
 
     all_entries: List[Dict[str, Any]] = []
-    seen_words = set()
+    by_word: Dict[str, Dict[str, Any]] = {}
     last_err = None
     failed_batches = 0
     total_batches = 0
@@ -546,13 +595,20 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
 
             for e in batch_entries:
                 key = e.get("word", "").strip().lower()
-                if not key or key in seen_words:
+                if not key:
                     continue
-                seen_words.add(key)
-                e["detected_unit"] = seg["unit"]
-                e["detected_section"] = seg["section"]
-                e["detected_lesson"] = seg["lesson"]
-                all_entries.append(e)
+                if key in by_word:
+                    # Same word seen again — merge new fields in (e.g. a
+                    # Definitions/Synonyms/Antonyms table found later in the
+                    # same lesson) instead of dropping them. Keep the placement
+                    # (unit/section/lesson) from the FIRST time we saw it.
+                    _merge_entry(by_word[key], e)
+                else:
+                    e["detected_unit"] = seg["unit"]
+                    e["detected_section"] = seg["section"]
+                    e["detected_lesson"] = seg["lesson"]
+                    by_word[key] = e
+                    all_entries.append(e)
 
     if total_batches and failed_batches == total_batches and last_err is not None:
         raise last_err

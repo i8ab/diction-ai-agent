@@ -328,7 +328,7 @@ def _call_gemini(text: str) -> str:
 
 def _call_groq(text: str) -> str:
     completion = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b"),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Text from the book:\n{text[:MAX_INPUT_CHARS]}"}

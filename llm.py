@@ -113,6 +113,17 @@ Your job:
    it does not create a new one (unless the collocation/idiom itself is the vocabulary item being
    taught, e.g. "play a major role" as its own phrase entry).
 
+   OCR SHORTHAND: when the input text was produced by our own OCR step (scanned page → text),
+   it may contain lines in these exact machine-generated formats instead of a real printed table:
+     DEF: english_word :: the English definition sentence
+     SYN: english_word :: synonym1, synonym2
+     ANT: english_word :: antonym1, antonym2
+   Treat each of these exactly like a row from a real "Definitions"/"Synonyms"/"Antonyms" table for
+   that word — extract the content after "::" into the matching field (definition / synonyms /
+   antonyms) and merge it into that word's single entry, using the same merge rules as above.
+   These lines are never vocabulary items in their own right and must never become a separate entry
+   (there is no word called "DEF" or "SYN").
+
 2. For each word extract:
    - word (the English word)
    - meaning (ONE primary Arabic meaning - clear and short)
@@ -617,19 +628,31 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
 
 
 OCR_PROMPT = (
-    "This image is a bilingual English-Arabic vocabulary table from a school textbook. "
-    "It may have MULTIPLE side-by-side column blocks per row (e.g. several word/translation "
-    "pairs across the same row, under section headers like 'Part 1', 'Part 2'). "
-    "Extract EVERY word pair you see, reading each column block fully top-to-bottom before "
-    "moving to the next block to the right. For EACH pair output exactly one line:\n"
-    "english_word = الترجمة العربية\n"
+    "This image is a page from a bilingual English-Arabic school textbook or revision book. "
+    "It may contain ANY of the following block types, sometimes several on the same page:\n"
+    "  (a) A vocabulary table with MULTIPLE side-by-side column blocks per row (several "
+    "word/translation pairs across the same row, under headers like 'Part 1', 'Part 2').\n"
+    "  (b) A 'Definitions' table: word ↔ an English definition/explanation sentence.\n"
+    "  (c) A 'Synonyms' table: word ↔ one or more synonym words/phrases.\n"
+    "  (d) An 'Antonyms' table: word ↔ one or more antonym words/phrases.\n"
+    "Transcribe EVERYTHING relevant on the page — do not limit yourself to simple word=meaning "
+    "pairs. Read each block fully top-to-bottom before moving to the next block to the right. "
+    "Output plain text using EXACTLY these line formats, one entry per line, and nothing else "
+    "on the line:\n"
+    "  - Vocabulary pair:      english_word = الترجمة العربية\n"
+    "  - Definition entry:     DEF: english_word :: the English definition sentence\n"
+    "  - Synonym entry:        SYN: english_word :: synonym1, synonym2\n"
+    "  - Antonym entry:        ANT: english_word :: antonym1, antonym2\n"
+    "  - Section/table title:  ## <the heading text, e.g. Part 1 / Definitions / Synonyms / Antonyms>\n"
     "Rules:\n"
-    "- One pair per line, nothing else on the line.\n"
+    "- One entry per line, nothing else on the line.\n"
     "- Keep the English word/phrase exactly as written (including phrasal verbs like 'seek to').\n"
-    "- Keep the Arabic translation exactly as written, including any '/' alternatives.\n"
-    "- Do NOT merge two different rows together and do NOT skip any row.\n"
-    "- If a 'Part' or section title appears, output a line: ## Part N\n"
-    "- Output plain text only, no markdown table, no extra commentary."
+    "- Keep Arabic text exactly as written, including any '/' alternatives.\n"
+    "- Do NOT merge two different rows together and do NOT skip any row, in ANY of the block types.\n"
+    "- If a word appears in a Definitions/Synonyms/Antonyms table, still emit it using the DEF:/SYN:/ANT: "
+    "format above, even if that same word also appears in the plain vocabulary table elsewhere on the page.\n"
+    "- Never invent a definition, synonym, or antonym — only transcribe what is visibly printed.\n"
+    "- Output plain text only, no markdown table formatting, no extra commentary."
 )
 
 

@@ -37,7 +37,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # request with a 504 Gateway Timeout before our code ever got to send a response.
 # Every one of these calls is pure network I/O, so running a handful in parallel
 # with threads cuts the wall-clock time roughly by this factor for free.
-MAX_PARALLEL_CALLS = int(os.getenv("AI_AGENT_MAX_PARALLEL_CALLS", "4"))
+MAX_PARALLEL_CALLS = int(os.getenv("AI_AGENT_MAX_PARALLEL_CALLS", "2"))
 
 
 def _run_parallel(items, fn, max_workers: int = MAX_PARALLEL_CALLS):
@@ -994,6 +994,32 @@ def extract_vocabulary_from_pdf(
             return idx, _ocr_page_with_gemini(png_bytes)
 
         ocr_results = _run_parallel(list(zip(page_nums, page_images)), _ocr_one)
+
+        # A page that failed almost always failed because of a rate limit (429),
+        # not a real OCR problem — and the whole point of running pages in
+        # parallel is that they ALL hit the provider in the same burst, which is
+        # exactly what trips a strict RPM/TPM quota (common on free-tier keys).
+        # Rather than silently losing that page's words, wait for the burst to
+        # clear and retry the failed pages ONE AT A TIME (no new burst) before
+        # giving up on them for good.
+        failed_idx = [
+            i for i, r in enumerate(ocr_results) if isinstance(r, Exception)
+        ]
+        if failed_idx:
+            logger.warning(
+                "extract_vocabulary_from_pdf: %d/%d OCR page(s) failed on the first "
+                "pass (likely rate limit) — retrying them one at a time after a "
+                "short cooldown",
+                len(failed_idx), len(ocr_results),
+            )
+            time.sleep(8.0)
+            for i in failed_idx:
+                page_idx, png_bytes = page_nums[i], page_images[i]
+                try:
+                    ocr_results[i] = (page_idx, _ocr_page_with_gemini(png_bytes))
+                except Exception as ex:
+                    ocr_results[i] = ex
+                    logger.warning("OCR retry still failing for page %d: %s", page_idx + 1, ex)
 
         parts = []
         for page_idx, result in zip(page_nums, ocr_results):

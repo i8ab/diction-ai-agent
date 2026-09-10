@@ -3,6 +3,7 @@ import json
 import io
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("diction.llm")
@@ -27,6 +28,47 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# ====================== Concurrency (fixes 504 timeouts on multi-page PDFs) ======================
+# OCR pages and vocabulary-extraction batches used to be processed ONE AT A TIME,
+# each waiting on a full Gemini/Groq network round-trip (often 5-20s). A 10-page
+# scanned PDF could easily take 2-5 minutes end to end — long enough for the
+# hosting platform's own reverse-proxy timeout (Railway, Render, etc.) to kill the
+# request with a 504 Gateway Timeout before our code ever got to send a response.
+# Every one of these calls is pure network I/O, so running a handful in parallel
+# with threads cuts the wall-clock time roughly by this factor for free.
+MAX_PARALLEL_CALLS = int(os.getenv("AI_AGENT_MAX_PARALLEL_CALLS", "4"))
+
+
+def _run_parallel(items, fn, max_workers: int = MAX_PARALLEL_CALLS):
+    """Run fn(item) for every item in parallel, but return results in the SAME
+    order as `items` — order matters for structure detection and for the
+    "first occurrence wins" merge priority used elsewhere in this file.
+    Any exception raised by fn(item) is placed in that item's result slot
+    instead of propagating, so one slow/broken item can't take down the rest —
+    the caller handles per-item failures exactly like it did before."""
+    items = list(items)
+    if not items:
+        return []
+    if len(items) == 1 or max_workers <= 1:
+        results = []
+        for item in items:
+            try:
+                results.append(fn(item))
+            except Exception as ex:
+                results.append(ex)
+        return results
+
+    results = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
+        future_to_idx = {pool.submit(fn, item): idx for idx, item in enumerate(items)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as ex:
+                results[idx] = ex
+    return results
 
 
 def _gemini_generate_with_retry(max_retries: int = 4, base_delay: float = 2.0, **kwargs):
@@ -677,17 +719,24 @@ def extract_vocabulary_from_text(text: str) -> List[Dict[str, Any]]:
     last_err = None
     failed_batches = 0
 
-    for i, batch in enumerate(batches):
-        logger.info("extract_vocabulary_from_text: processing batch %d/%d (%d chars)",
-                    i + 1, len(batches), len(batch))
-        try:
-            batch_entries = _extract_vocabulary_single_batch(batch)
-        except Exception as ex:
+    # Fire all batch calls concurrently — they're independent LLM requests, so this
+    # is what keeps a book with many batches from timing out the whole request.
+    # Results come back in the SAME order as `batches`, so the merge below still
+    # behaves exactly like the old sequential loop (first occurrence wins).
+    batch_results = _run_parallel(
+        enumerate(batches),
+        lambda pair: _extract_vocabulary_single_batch(pair[1]),
+    )
+
+    for i, batch_entries in enumerate(batch_results):
+        if isinstance(batch_entries, Exception):
             logger.exception("extract_vocabulary_from_text: batch %d/%d failed: %s",
-                              i + 1, len(batches), ex)
-            last_err = ex
+                              i + 1, len(batches), batch_entries)
+            last_err = batch_entries
             failed_batches += 1
             continue
+        logger.info("extract_vocabulary_from_text: batch %d/%d returned %d entries",
+                    i + 1, len(batches), len(batch_entries))
 
         for e in batch_entries:
             key = e.get("word", "").strip().lower()
@@ -739,7 +788,35 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
     all_entries: List[Dict[str, Any]] = []
     last_err = None
     failed_batches = 0
-    total_batches = 0
+
+    # Flatten (segment, batch) across the WHOLE book into one job list and run every
+    # LLM call concurrently — this is the main fix for large multi-lesson books timing
+    # out: instead of "segment 1's batches, then segment 2's batches, ..." one at a
+    # time, every batch in the entire document fires at once (capped by
+    # MAX_PARALLEL_CALLS). Results come back in the same flat order, then get
+    # regrouped by segment below so the per-segment `by_word` merge scoping (see the
+    # comment on it) behaves exactly like the old sequential version.
+    jobs = []  # (seg_idx, batch_idx, batch_text)
+    seg_batches: List[List[str]] = []
+    for seg in segments:
+        batches = _split_into_batches(seg["text"])
+        seg_batches.append(batches)
+        for b_idx, batch in enumerate(batches):
+            jobs.append((len(seg_batches) - 1, b_idx, batch))
+    total_batches = len(jobs)
+
+    logger.info(
+        "extract_vocabulary_from_text_with_structure: %d segment(s), %d batch(es) total, "
+        "running up to %d concurrently",
+        len(segments), total_batches, MAX_PARALLEL_CALLS,
+    )
+
+    job_results = _run_parallel(jobs, lambda job: _extract_vocabulary_single_batch(job[2]))
+
+    # Regroup flat results back into per-segment order.
+    results_by_seg: Dict[int, List[Any]] = {i: [] for i in range(len(segments))}
+    for (seg_idx, b_idx, _batch), result in zip(jobs, job_results):
+        results_by_seg[seg_idx].append((b_idx, result))
 
     for seg_idx, seg in enumerate(segments):
         # `by_word` is scoped to THIS segment only. Merging must never cross a lesson
@@ -748,25 +825,21 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
         # into the first lesson's entry (which used to make the second lesson's word
         # list look incomplete / not matching the book's own division).
         by_word: Dict[str, Dict[str, Any]] = {}
-        batches = _split_into_batches(seg["text"])
-        total_batches += len(batches)
-        for i, batch in enumerate(batches):
-            logger.info(
-                "extract_vocabulary_from_text_with_structure: segment %d/%d batch %d/%d "
-                "(unit=%s section=%s lesson=%s, %d chars)",
-                seg_idx + 1, len(segments), i + 1, len(batches),
-                seg["unit"], seg["section"], seg["lesson"], len(batch),
-            )
-            try:
-                batch_entries = _extract_vocabulary_single_batch(batch)
-            except Exception as ex:
+        for b_idx, batch_entries in sorted(results_by_seg[seg_idx]):
+            if isinstance(batch_entries, Exception):
                 logger.exception(
                     "extract_vocabulary_from_text_with_structure: segment %d batch %d failed: %s",
-                    seg_idx + 1, i + 1, ex,
+                    seg_idx + 1, b_idx + 1, batch_entries,
                 )
-                last_err = ex
+                last_err = batch_entries
                 failed_batches += 1
                 continue
+            logger.info(
+                "extract_vocabulary_from_text_with_structure: segment %d/%d batch %d/%d "
+                "(unit=%s section=%s lesson=%s) returned %d entries",
+                seg_idx + 1, len(segments), b_idx + 1, len(seg_batches[seg_idx]),
+                seg["unit"], seg["section"], seg["lesson"], len(batch_entries),
+            )
 
             for e in batch_entries:
                 key = e.get("word", "").strip().lower()
@@ -904,28 +977,40 @@ def extract_vocabulary_from_pdf(
                 "This PDF looks scanned (image-only). OCR needs GEMINI_API_KEY."
             )
 
-        parts = []
-        ocr_count = 0
-        for i in range(start_idx, end):
-            if ocr_count >= max_ocr_pages:
-                parts.append(
-                    f"[Stopped OCR at {max_ocr_pages} pages within selected range]"
-                )
-                break
-            page = doc[i]
+        # Render every page to a PNG up front (fast, CPU-only, must stay on the
+        # main thread — fitz/PyMuPDF objects aren't thread-safe), then OCR all of
+        # them concurrently. This is what turns "N pages × 5-20s each, one after
+        # another" into roughly "N pages / MAX_PARALLEL_CALLS batches", which is
+        # usually the difference between a normal response and a 504 timeout.
+        page_nums = list(range(start_idx, min(end, start_idx + max_ocr_pages)))
+        page_images = []
+        for i in page_nums:
             mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            png_bytes = pix.tobytes("png")
-            try:
-                page_text = _ocr_page_with_gemini(png_bytes)
-                logger.info("OCR page %d: %d chars extracted, preview=%r",
-                            i + 1, len(page_text), page_text[:200])
-                if page_text:
-                    parts.append("--- Page %d ---\n%s" % (i + 1, page_text))
-            except Exception as ex:
-                logger.exception("OCR failed on page %d", i + 1)
-                parts.append("--- Page %d (OCR failed: %s) ---" % (i + 1, ex))
-            ocr_count += 1
+            pix = doc[i].get_pixmap(matrix=mat, alpha=False)
+            page_images.append(pix.tobytes("png"))
+
+        def _ocr_one(args):
+            idx, png_bytes = args
+            return idx, _ocr_page_with_gemini(png_bytes)
+
+        ocr_results = _run_parallel(list(zip(page_nums, page_images)), _ocr_one)
+
+        parts = []
+        for page_idx, result in zip(page_nums, ocr_results):
+            if isinstance(result, Exception):
+                logger.exception("OCR failed on page %d", page_idx + 1)
+                parts.append("--- Page %d (OCR failed: %s) ---" % (page_idx + 1, result))
+                continue
+            _, page_text = result
+            logger.info("OCR page %d: %d chars extracted, preview=%r",
+                        page_idx + 1, len(page_text), page_text[:200])
+            if page_text:
+                parts.append("--- Page %d ---\n%s" % (page_idx + 1, page_text))
+
+        if end > start_idx + max_ocr_pages:
+            parts.append(
+                f"[Stopped OCR at {max_ocr_pages} pages within selected range]"
+            )
 
         full_text = "\n\n".join(parts)
         used_ocr = True

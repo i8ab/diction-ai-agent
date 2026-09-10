@@ -3,7 +3,7 @@ import json
 import io
 import time
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("diction.llm")
 logging.basicConfig(level=logging.INFO)
@@ -127,6 +127,37 @@ Your job:
 2. For each word extract:
    - word (the English word)
    - meaning (ONE primary Arabic meaning - clear and short)
+   - category (which book section this word's PRIMARY listing belongs to — REQUIRED,
+     always include this field). Choose EXACTLY one of these labels (use the English
+     label even if the book's heading was Arabic):
+       "Key Vocabulary"        — a general word=meaning glossary list, OR any list with
+                                   no distinguishing heading at all (this is the default
+                                   — use it whenever nothing more specific applies).
+       "Important Vocabulary"  — heading literally says "Important Vocabulary" /
+                                   "مفردات هامة" / "كلمات مهمة" or similar emphasis wording.
+       "Definitions"           — the word's ONLY listing is a word ↔ definition table
+                                   (no separate word=meaning glossary entry for it elsewhere).
+       "Synonyms"              — the word's ONLY listing is inside a Synonyms table/glossary.
+       "Antonyms"              — the word's ONLY listing is inside an Antonyms table/glossary.
+       "Verbal Collocations"   — the item IS a verb+noun collocation phrase being taught
+                                   as its own vocabulary item (e.g. "create unrealistic
+                                   expectations", "play a major role").
+       "Expressions & Idioms"  — the item is an idiom/fixed expression being taught as its
+                                   own vocabulary item.
+       "Verb + Preposition"    — the item is a verb+preposition / phrasal-verb pattern being
+                                   taught as its own vocabulary item (e.g. "seek to", "look
+                                   forward to").
+       "Language Notes"        — a grammar/usage note about the word (e.g. a "✗ Don't mix"
+                                   contrast, a Word Family note) that isn't really a
+                                   standalone vocabulary word.
+     IMPORTANT: category describes where the word's MAIN listing (its meaning) came from.
+     If a word is first found in a plain vocabulary list and LATER also appears in a
+     Definitions/Synonyms/Antonyms table just to enrich it (per the merge rules below),
+     it still keeps its original category (e.g. "Key Vocabulary") — a supplementary table
+     never changes a word's category once it already has a meaning from a real glossary.
+     Only use "Definitions" / "Synonyms" / "Antonyms" / "Verbal Collocations" /
+     "Expressions & Idioms" / "Verb + Preposition" as the category when that table/list IS
+     the word's only source (nothing else about it appears in a plain glossary).
    - pos (part of speech — be extremely precise):
      Allowed values ONLY: noun, verb, adjective, adverb, preposition, conjunction,
      pronoun, interjection, phrase, other, unclassified.
@@ -146,7 +177,7 @@ Your job:
 
 IMPORTANT — keep the JSON compact:
 - Omit any field you don't have real content for instead of writing empty strings/arrays,
-  EXCEPT "word" and "meaning" which are always required.
+  EXCEPT "word", "meaning", and "category" which are always required.
 - Do not add "senses" unless the word genuinely has more than one distinct meaning/pos in the book.
 
 IMPORTANT - One entry per English word spelling:
@@ -188,6 +219,7 @@ Example format — "bow" has two senses (include per-sense fields when available
   {
     "word": "bow",
     "meaning": "قوس",
+    "category": "Key Vocabulary",
     "pos": "noun",
     "senses": [
       {
@@ -207,13 +239,22 @@ Example format — "bow" has two senses (include per-sense fields when available
   {
     "word": "bank",
     "meaning": "بنك",
+    "category": "Important Vocabulary",
     "pos": "noun",
     "definition": "a financial institution that accepts deposits and lends money",
     "importance": "key"
   },
   {
+    "word": "seek to",
+    "meaning": "يسعى إلى",
+    "category": "Verb + Preposition",
+    "pos": "phrase",
+    "importance": "key"
+  },
+  {
     "word": "COVID-19",
     "meaning": "كوفيد-19",
+    "category": "Key Vocabulary",
     "pos": "unclassified",
     "importance": "additional"
   }
@@ -236,8 +277,40 @@ _AR_LETTER_TO_EN = {
     "خ": "G", "د": "H", "ذ": "I", "ر": "J",
 }
 
+# Arabic-Indic digits → Latin, so "الدرس ٣" is recognized the same as "الدرس 3".
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+# Spelled-out ordinal/cardinal numbers, English and Arabic, up to 20 — covers the very
+# common "Lesson One" / "Unit Two" / "الدرس الأول" / "الوحدة الثالثة" style headings that
+# the old digit-only regex silently missed (and so put those words in "no lesson").
+_EN_WORD_NUMS = {
+    "one": 1, "first": 1, "two": 2, "second": 2, "three": 3, "third": 3,
+    "four": 4, "fourth": 4, "five": 5, "fifth": 5, "six": 6, "sixth": 6,
+    "seven": 7, "seventh": 7, "eight": 8, "eighth": 8, "nine": 9, "ninth": 9,
+    "ten": 10, "tenth": 10, "eleven": 11, "eleventh": 11, "twelve": 12, "twelfth": 12,
+    "thirteen": 13, "thirteenth": 13, "fourteen": 14, "fourteenth": 14,
+    "fifteen": 15, "fifteenth": 15, "sixteen": 16, "sixteenth": 16,
+    "seventeen": 17, "seventeenth": 17, "eighteen": 18, "eighteenth": 18,
+    "nineteen": 19, "nineteenth": 19, "twenty": 20, "twentieth": 20,
+}
+_AR_WORD_NUMS = {
+    "الأول": 1, "الاول": 1, "الأولى": 1, "الاولى": 1,
+    "الثاني": 2, "الثانية": 2, "الثالث": 3, "الثالثة": 3,
+    "الرابع": 4, "الرابعة": 4, "الخامس": 5, "الخامسة": 5,
+    "السادس": 6, "السادسة": 6, "السابع": 7, "السابعة": 7,
+    "الثامن": 8, "الثامنة": 8, "التاسع": 9, "التاسعة": 9,
+    "العاشر": 10, "العاشرة": 10,
+    "الحادي عشر": 11, "الثاني عشر": 12, "الثالث عشر": 13,
+}
+_EN_WORD_NUM_RE = "|".join(sorted(_EN_WORD_NUMS, key=len, reverse=True))
+_AR_WORD_NUM_RE = "|".join(sorted(_AR_WORD_NUMS, key=len, reverse=True))
+
+# Number part shared by unit/section/lesson: a plain digit run, OR a spelled-out
+# English/Arabic ordinal word, OR "(3)" / "no. 3" / "#3" style wrappers.
+_NUM_PART = rf"(?:\(?\s*(?:no\.?|#)?\s*(\d+)\s*\)?|({_EN_WORD_NUM_RE})|({_AR_WORD_NUM_RE}))"
+
 _UNIT_RE = _re.compile(
-    r"(?:^|\n)\s*(?:unit|الوحدة|وحدة)\s*[:\-–]?\s*(\d+)",
+    rf"(?:^|\n)\s*(?:unit|module|chapter|الوحدة|وحدة)\s*[:\-–]?\s*{_NUM_PART}",
     _re.IGNORECASE,
 )
 _SECTION_RE = _re.compile(
@@ -245,9 +318,24 @@ _SECTION_RE = _re.compile(
     _re.IGNORECASE,
 )
 _LESSON_RE = _re.compile(
-    r"(?:^|\n)\s*(?:lesson|الدرس|درس)\s*[:\-–]?\s*(\d+)",
+    rf"(?:^|\n)\s*(?:lesson|الدرس|درس)\s*[:\-–]?\s*{_NUM_PART}",
     _re.IGNORECASE,
 )
+
+
+def _resolve_num_part(m: "_re.Match", group_offset: int) -> Optional[str]:
+    """Pull whichever alternative of _NUM_PART matched (digit / EN word / AR word)
+    and normalize it to a plain digit string."""
+    digit, en_word, ar_word = (
+        m.group(group_offset), m.group(group_offset + 1), m.group(group_offset + 2)
+    )
+    if digit:
+        return digit.translate(_ARABIC_DIGITS).strip()
+    if en_word:
+        return str(_EN_WORD_NUMS.get(en_word.lower()))
+    if ar_word:
+        return str(_AR_WORD_NUMS.get(ar_word))
+    return None
 
 
 def _normalize_section_label(raw: str) -> str:
@@ -270,11 +358,15 @@ def detect_structure_segments(text: str) -> List[Dict[str, Any]]:
     # Collect every heading match (any kind) with its position, in document order.
     markers = []
     for m in _UNIT_RE.finditer(text):
-        markers.append((m.start(), "unit", m.group(1).strip()))
+        val = _resolve_num_part(m, 1)
+        if val:
+            markers.append((m.start(), "unit", val))
     for m in _SECTION_RE.finditer(text):
         markers.append((m.start(), "section", _normalize_section_label(m.group(1))))
     for m in _LESSON_RE.finditer(text):
-        markers.append((m.start(), "lesson", m.group(1).strip()))
+        val = _resolve_num_part(m, 1)
+        if val:
+            markers.append((m.start(), "lesson", val))
     markers.sort(key=lambda x: x[0])
 
     if not markers:
@@ -326,8 +418,39 @@ def _call_gemini(text: str) -> str:
     return _extract_text(response)
 
 
+def _groq_generate_with_retry(max_retries: int = 3, base_delay: float = 1.5, **kwargs):
+    """Call groq_client.chat.completions.create with retry on transient errors
+    (rate limit / 5xx / connection issues) using exponential backoff — mirrors the
+    Gemini retry helper so a single flaky API call doesn't fail the whole extraction."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return groq_client.chat.completions.create(**kwargs)
+        except Exception as e:
+            status = getattr(e, "status_code", None) or getattr(e, "code", None)
+            msg = str(e)
+            transient = (
+                status in (429, 500, 502, 503, 504)
+                or "rate limit" in msg.lower()
+                or "timeout" in msg.lower()
+                or "overloaded" in msg.lower()
+                or "internal server error" in msg.lower()
+                or "connection" in msg.lower()
+            )
+            last_err = e
+            if not transient or attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "Groq call failed (attempt %d/%d, transient=%s): %s — retrying in %.1fs",
+                attempt + 1, max_retries, transient, msg, delay,
+            )
+            time.sleep(delay)
+    raise last_err
+
+
 def _call_groq(text: str) -> str:
-    completion = groq_client.chat.completions.create(
+    completion = _groq_generate_with_retry(
         model=os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b"),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -418,6 +541,38 @@ def _clean_json(raw: str) -> List[Dict]:
     return []
 
 
+_ALLOWED_CATEGORIES = {
+    "key vocabulary", "important vocabulary", "definitions", "synonyms",
+    "antonyms", "verbal collocations", "expressions & idioms",
+    "verb + preposition", "language notes",
+}
+_CATEGORY_CANONICAL = {
+    "key vocabulary": "Key Vocabulary",
+    "important vocabulary": "Important Vocabulary",
+    "definitions": "Definitions",
+    "synonyms": "Synonyms",
+    "antonyms": "Antonyms",
+    "verbal collocations": "Verbal Collocations",
+    "expressions & idioms": "Expressions & Idioms",
+    "expressions and idioms": "Expressions & Idioms",
+    "idioms": "Expressions & Idioms",
+    "verb + preposition": "Verb + Preposition",
+    "verb+preposition": "Verb + Preposition",
+    "language notes": "Language Notes",
+}
+
+
+def _normalize_category(raw: Any) -> str:
+    """Coerce whatever the model returned for `category` onto one of the fixed
+    labels the frontend understands, defaulting to "Key Vocabulary" — this way a
+    word NEVER ends up with a missing/unrecognized category just because the
+    model phrased it slightly differently or forgot the field."""
+    text = str(raw or "").strip().lower()
+    if text in _CATEGORY_CANONICAL:
+        return _CATEGORY_CANONICAL[text]
+    return "Key Vocabulary"
+
+
 def _extract_vocabulary_single_batch(text: str) -> List[Dict[str, Any]]:
     """Run one LLM call over a chunk of text small enough to avoid output truncation."""
     provider = LLM_PROVIDER
@@ -450,6 +605,7 @@ def _extract_vocabulary_single_batch(text: str) -> List[Dict[str, Any]]:
     for e in entries:
         if not e.get("word"):
             continue
+        e["category"] = _normalize_category(e.get("category"))
         cleaned.append(e)
 
     return cleaned
@@ -490,8 +646,11 @@ def _merge_entry(existing: Dict[str, Any], incoming: Dict[str, Any]) -> None:
     was found in a "Vocabulary" table get its definition/synonyms/antonyms filled
     in later from separate "Definitions"/"Synonyms"/"Antonyms" tables that landed
     in a different batch (common in Egyptian revision books). We never overwrite
-    a field that already has content — only fill in what's missing."""
-    for field in ("meaning", "pos", "definition", "example", "importance"):
+    a field that already has content — only fill in what's missing.
+    `category` is included here on purpose: once a word has a category from its
+    first (usually main-glossary) occurrence, a later supplementary-table sighting
+    must never override it — see the "category" rules in SYSTEM_PROMPT."""
+    for field in ("meaning", "category", "pos", "definition", "example", "importance"):
         if not existing.get(field) and incoming.get(field):
             existing[field] = incoming[field]
     for field in ("synonyms", "antonyms"):
@@ -578,12 +737,17 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
     )
 
     all_entries: List[Dict[str, Any]] = []
-    by_word: Dict[str, Dict[str, Any]] = {}
     last_err = None
     failed_batches = 0
     total_batches = 0
 
     for seg_idx, seg in enumerate(segments):
+        # `by_word` is scoped to THIS segment only. Merging must never cross a lesson
+        # boundary — if the same word legitimately appears again in a later lesson,
+        # it needs its own entry tagged with that lesson, not to be silently folded
+        # into the first lesson's entry (which used to make the second lesson's word
+        # list look incomplete / not matching the book's own division).
+        by_word: Dict[str, Dict[str, Any]] = {}
         batches = _split_into_batches(seg["text"])
         total_batches += len(batches)
         for i, batch in enumerate(batches):
@@ -609,10 +773,9 @@ def extract_vocabulary_from_text_with_structure(text: str) -> Dict[str, Any]:
                 if not key:
                     continue
                 if key in by_word:
-                    # Same word seen again — merge new fields in (e.g. a
-                    # Definitions/Synonyms/Antonyms table found later in the
-                    # same lesson) instead of dropping them. Keep the placement
-                    # (unit/section/lesson) from the FIRST time we saw it.
+                    # Same word seen again within the SAME lesson — merge new fields
+                    # in (e.g. a Definitions/Synonyms/Antonyms table found later in
+                    # the same lesson) instead of dropping them.
                     _merge_entry(by_word[key], e)
                 else:
                     e["detected_unit"] = seg["unit"]

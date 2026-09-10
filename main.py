@@ -83,6 +83,7 @@ class EntryOut(BaseModel):
     addedBy: str
     source_book: Optional[str] = None
     unit: Optional[str] = None
+    category: Optional[str] = None
     page: Optional[int] = None
     from_ai: bool = True
     importance: Optional[str] = None
@@ -240,6 +241,7 @@ def adapt_entry(
         "unit": unit or raw.get("unit") or raw.get("detected_unit"),
         "unitSection": resolved_unit_section,
         "lesson": resolved_lesson,
+        "category": raw.get("category"),
         "detectedUnit": raw.get("detected_unit"),
         "detectedSection": raw.get("detected_section"),
         "detectedLesson": raw.get("detected_lesson"),
